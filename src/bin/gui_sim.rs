@@ -1,11 +1,12 @@
 /// LoRa GUI simulator — raw spectrum + waterfall of the received IQ.
 ///
-/// The spectrum/waterfall is a plain windowed FFT of the raw (noisy) IQ signal,
-/// independent of the receiver.  AWGN frames show a flat noise floor; LoRa
-/// packets show the chirp sweeping across the centre of the band.
+/// The spectrum/waterfall is a plain Hann-windowed FFT of the raw IQ, fully
+/// decoupled from the receiver.  AWGN frames show a flat noise floor; LoRa
+/// packets show the chirp sweeping through the centre of the band.
 ///
-/// With os_factor > 1 the LoRa signal bandwidth is narrower than the sample
-/// rate, so the chirp occupies only the central 1/os_factor of the display.
+/// Sample rate = 4 × signal bandwidth by default (os_factor = 4).
+/// With bandwidth narrower than the sample rate the LoRa signal occupies
+/// only the central fraction of the display.
 ///
 /// Usage: gui_sim [sf] [snr_db]   (defaults: sf=7  snr=10)
 
@@ -31,6 +32,14 @@ use std::{
     sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/// Fixed simulated sample rate in kHz.  os_factor = SAMP_RATE_KHZ / bw_khz.
+const SAMP_RATE_KHZ: u32 = 1000;
+
+/// LoRa bandwidth options (kHz).  Default 250 kHz → os_factor = 4.
+const BW_OPTIONS_KHZ: &[u32] = &[125, 250, 500, 1000];
 
 // ─── TX / RX helpers ─────────────────────────────────────────────────────────
 
@@ -95,14 +104,14 @@ fn add_awgn(signal: &[Complex<f32>], snr_db: f32, rng: &mut impl Rng) -> Vec<Com
 /// Sliding Hann-windowed FFT of `iq` with step = `fft_size`.
 ///
 /// Returns one `Vec<[f64;2]>` per window: x = bin (0..fft_size), y = power dB.
-/// The output is fftshifted so DC is at bin fft_size/2; the LoRa signal
-/// (bandwidth = samp_rate / os_factor) appears centred.
+/// The output is fftshifted so DC is at bin fft_size/2.  With os_factor > 1
+/// the LoRa signal (bandwidth 1/os_factor of the sample rate) appears as a
+/// chirp sweep occupying the central fft_size/os_factor bins.
 fn raw_spectra(iq: &[Complex<f32>], fft_size: usize) -> Vec<Vec<[f64; 2]>> {
     let mut planner = FftPlanner::<f32>::new();
     let fft         = planner.plan_fft_forward(fft_size);
     let mut buf     = vec![Complex::new(0.0_f32, 0.0_f32); fft_size];
 
-    // Precompute Hann window coefficients.
     let hann: Vec<f32> = (0..fft_size)
         .map(|i| (0.5 * (1.0 - (TAU * i as f64 / fft_size as f64).cos())) as f32)
         .collect();
@@ -115,8 +124,7 @@ fn raw_spectra(iq: &[Complex<f32>], fft_size: usize) -> Vec<Vec<[f64; 2]>> {
         }
         fft.process(&mut buf);
 
-        // fftshift: bin 0 → display bin fft_size/2 (DC centred).
-        let half  = fft_size / 2;
+        let half = fft_size / 2;
         let spec: Vec<[f64; 2]> = (0..fft_size).map(|i| {
             let src = (i + half) % fft_size;
             let pdb = 10.0 * (buf[src].norm_sqr() as f64 + 1e-20_f64).log10();
@@ -176,7 +184,7 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         let iq    = tx_packet(payload, sf, 4, os_factor);
         let noisy = add_awgn(&iq, snr_db, &mut rng);
 
-        // Raw spectrum of the whole burst — always works, no sync required.
+        // Raw spectrum — always produces rows regardless of decode outcome.
         let spectra = raw_spectra(&noisy, fft_size);
         for spec in &spectra {
             shared.waterfall_plot.update(spec.clone());
@@ -187,7 +195,7 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         shared.waterfall_plot.set_freq(fft_size as f64 / 2.0);
         shared.waterfall_plot.set_bw(fft_size as f64);
 
-        // RX — for stats only, decoupled from the display.
+        // RX — for stats only, fully decoupled from the display.
         let result = rx_packet(&noisy, sf, 4, os_factor);
         {
             let mut s = shared.stats.lock().unwrap();
@@ -216,14 +224,16 @@ struct GuiApp {
     snr_db:      f32,
     interval_ms: u64,
     sf:          u8,
-    os_factor:   u32,
+    bw_khz:      u32,   // signal bandwidth; os_factor = SAMP_RATE_KHZ / bw_khz
     fft_size:    usize,
 }
 
 impl GuiApp {
     fn new(sf: u8, snr_db: f32) -> Self {
-        let os_factor = 1u32;
-        let fft_size  = 256usize;
+        // Default: 250 kHz BW → os_factor = 4 (sample rate = 4 × BW).
+        let bw_khz    = 250u32;
+        let os_factor = SAMP_RATE_KHZ / bw_khz;  // = 4
+        let fft_size  = 1024usize;
 
         let init_spec: Vec<[f64; 2]> = (0..fft_size).map(|i| [i as f64, -80.0]).collect();
 
@@ -266,20 +276,31 @@ impl GuiApp {
             snr_db,
             interval_ms: 250,
             sf,
-            os_factor,
+            bw_khz,
             fft_size,
         }
     }
 
     fn rebuild_plots(&mut self) {
+        let os_factor = SAMP_RATE_KHZ / self.bw_khz;
         self.spectrum_chart.set_x_limits([0.0, self.fft_size as f64]);
         self.waterfall_chart.set_x_limits([0.0, self.fft_size as f64]);
         *self.shared.sf.lock().unwrap()        = self.sf;
-        *self.shared.os_factor.lock().unwrap() = self.os_factor;
+        *self.shared.os_factor.lock().unwrap() = os_factor;
         *self.shared.fft_size.lock().unwrap()  = self.fft_size;
         self.shared.waterfall_plot.set_freq(self.fft_size as f64 / 2.0);
         self.shared.waterfall_plot.set_bw(self.fft_size as f64);
         *self.shared.stats.lock().unwrap() = Stats::default();
+    }
+}
+
+fn bw_label(bw_khz: u32) -> &'static str {
+    match bw_khz {
+        125  => "125k",
+        250  => "250k",
+        500  => "500k",
+        1000 => "1M",
+        _    => "?",
     }
 }
 
@@ -318,13 +339,14 @@ impl eframe::App for GuiApp {
 
                 ui.separator();
 
-                // OS factor selector
-                ui.label("OS:");
-                for &os in &[1u32, 2, 4, 8] {
-                    if ui.selectable_label(self.os_factor == os, format!("×{os}")).clicked()
-                        && self.os_factor != os
+                // BW selector — sample rate is shown as a fixed label.
+                // os_factor = SAMP_RATE_KHZ / bw_khz; default 250 kHz → ×4.
+                ui.label(format!("SR: {} MHz  BW:", SAMP_RATE_KHZ as f32 / 1000.0));
+                for &bw in BW_OPTIONS_KHZ {
+                    if ui.selectable_label(self.bw_khz == bw, bw_label(bw)).clicked()
+                        && self.bw_khz != bw
                     {
-                        self.os_factor = os;
+                        self.bw_khz = bw;
                         changed = true;
                     }
                 }
@@ -333,7 +355,7 @@ impl eframe::App for GuiApp {
 
                 // FFT size selector
                 ui.label("FFT:");
-                for &sz in &[64usize, 128, 256, 512, 1024] {
+                for &sz in &[1024usize, 2048, 4096, 8192] {
                     if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
                         && self.fft_size != sz
                     {
@@ -404,7 +426,7 @@ fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("LoRa Link Simulator")
-            .with_inner_size([1200.0, 750.0]),
+            .with_inner_size([1280.0, 750.0]),
         ..Default::default()
     };
 
