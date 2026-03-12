@@ -8,9 +8,9 @@ BUILDDIR = build
 
 # Shared sources — compiled into objects linked by every test
 LIB_SRCS = tx/01-whitening.cpp tx/02-header.cpp tx/03-crc.cpp tx/04-hamming_enc.cpp \
-           tx/05-interleaver.cpp tx/06-gray_mapping.cpp \
+           tx/05-interleaver.cpp tx/06-gray_demap.cpp \
            rx/01-dewhitening.cpp rx/02-header_decoder.cpp rx/03-crc_verif.cpp rx/04-hamming_dec.cpp \
-           rx/05-deinterleaver.cpp rx/06-gray_demap.cpp
+           rx/05-deinterleaver.cpp rx/06-gray_mapping.cpp
 LIB_OBJS = $(patsubst %.cpp,$(BUILDDIR)/%.o,$(LIB_SRCS))
 
 # Each tests/*.cpp becomes its own binary in bin/
