@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rustfft = "6.4.1"
-rand    = { version = "0.10.0", features = ["std_rng"] }
+rustfft  = "6.4.1"
+rand     = { version = "0.10.0", features = ["std_rng"] }
+egui     = "0.33.0"
+eframe   = { version = "0.33.0", default-features = false, features = ["default_fonts", "glow"] }
+egui_plot = "0.34.0"
