@@ -376,7 +376,7 @@ const MAX_LOG_ENTRIES: usize = 200;
 
 // ─── Sim thread ───────────────────────────────────────────────────────────────
 
-fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
+fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x10_4a);
     let payloads: &[&[u8]] = &[
         b"Hello, LoRa!", b"Rust 2024", b"AWGN channel",
@@ -395,13 +395,20 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
 
     // Spawn worker threads.
     let (rx_send,   rx_recv)   = std::sync::mpsc::channel::<RxJob>();
-    let (disp_send, disp_recv) = std::sync::mpsc::channel::<DisplayJob>();
     // sync_channel(1): tx_worker stays at most one packet ahead.
     let (tx_job_send, tx_job_recv) = std::sync::mpsc::channel::<TxJob>();
     let (tx_res_send, tx_res_recv) = std::sync::mpsc::sync_channel::<TxResult>(1);
     { let s = shared.clone(); std::thread::spawn(move || rx_worker(rx_recv, s)); }
-    { let s = shared.clone(); std::thread::spawn(move || display_worker(disp_recv, s)); }
     std::thread::spawn(move || tx_worker(tx_job_recv, tx_res_send));
+
+    // Display thread is only needed in GUI mode.
+    let disp_send: Option<std::sync::mpsc::Sender<DisplayJob>> = if ctx.is_some() {
+        let (tx, rx) = std::sync::mpsc::channel::<DisplayJob>();
+        { let s = shared.clone(); std::thread::spawn(move || display_worker(rx, s)); }
+        Some(tx)
+    } else {
+        None
+    };
 
     let init_noise_db = *shared.noise_db.lock().unwrap();
     let mut channel = Channel::new(
@@ -531,9 +538,14 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         let avail_rows  = channel.pending_len() / fft_size;
         let rows        = target_rows.min(avail_rows.max(1)); // always at least 1 (noise fallback)
 
-        for i in 0..rows {
-            let window = channel.read(fft_size, &mut rng);
-            let _ = disp_send.send((window, i + 1 == rows));
+        if let Some(ref ds) = disp_send {
+            for i in 0..rows {
+                let window = channel.read(fft_size, &mut rng);
+                let _ = ds.send((window, i + 1 == rows));
+            }
+        } else {
+            // Headless: drain the channel to prevent unbounded growth.
+            for _ in 0..rows { channel.read(fft_size, &mut rng); }
         }
 
         // ── Buffer status ─────────────────────────────────────────────────
@@ -549,7 +561,7 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         shared.waterfall_plot.set_freq(fft_size as f64 / 2.0);
         shared.waterfall_plot.set_bw(fft_size as f64);
 
-        ctx.request_repaint();
+        if let Some(ref c) = ctx { c.request_repaint(); }
 
         let elapsed = tick_start.elapsed();
         if elapsed < TICK { std::thread::sleep(TICK - elapsed); }
@@ -697,7 +709,7 @@ impl eframe::App for GuiApp {
             self.thread_started = true;
             let shared = self.shared.clone();
             let ctx2   = ctx.clone();
-            std::thread::spawn(move || sim_loop(shared, ctx2));
+            std::thread::spawn(move || sim_loop(shared, Some(ctx2)));
         }
 
         let running = self.shared.running.load(Ordering::Relaxed);
@@ -891,11 +903,91 @@ impl eframe::App for GuiApp {
     }
 }
 
+// ─── CLI / headless mode ──────────────────────────────────────────────────────
+
+/// Run the simulator headlessly and print per-packet results to stdout.
+///
+/// Useful for automated tests and CI: exits once `packet_count` packets have
+/// been decoded (success or failure).
+pub fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
+    let signal_db = DEFAULT_SIGNAL_DB;
+    let noise_db  = signal_db - snr_db_val;
+    let samp_rate_khz = DEFAULT_SAMP_RATE_KHZ;
+    let bw_khz        = DEFAULT_BW_KHZ;
+    let (eff_sr, os_factor) = effective_sr_and_os(samp_rate_khz, bw_khz);
+    let fft_size = DEFAULT_FFT_SIZE;
+
+    let init_spec: Vec<[f64; 2]> = (0..fft_size).map(|i| [i as f64, -80.0]).collect();
+    let spectrum_plot  = SpectrumPlot::new("Spectrum",   init_spec.clone(), -80.0, 80.0);
+    let waterfall_plot = WaterfallPlot::new("Waterfall", init_spec,         -80.0);
+
+    let shared = Arc::new(SimShared {
+        running:        AtomicBool::new(true),
+        clear_buf:      AtomicBool::new(false),
+        sf:             Mutex::new(sf),
+        os_factor:      Mutex::new(os_factor),
+        samp_rate_khz:  Mutex::new(eff_sr),
+        fft_size:       Mutex::new(fft_size),
+        signal_db:      Mutex::new(signal_db),
+        noise_db:       Mutex::new(noise_db),
+        interval_ms:    Mutex::new(0),   // back-to-back packets
+        spectrum_plot,
+        waterfall_plot,
+        stats:          Mutex::new(Stats::default()),
+        log:            Mutex::new(VecDeque::new()),
+        buf_lag_ms:     AtomicU32::new(0),
+        buf_overflow:   AtomicBool::new(false),
+        buf_underflow:  AtomicBool::new(false),
+    });
+
+    { let s = shared.clone(); std::thread::spawn(move || sim_loop(s, None)); }
+
+    let mut printed = 0usize;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let log = shared.log.lock().unwrap().clone();
+        // Print any entries we haven't shown yet.
+        for entry in log.iter().skip(printed) {
+            let mark = if entry.ok { "OK  " } else { "FAIL" };
+            println!("[{mark}] {}", entry.payload);
+        }
+        printed = log.len();
+
+        let stats = shared.stats.lock().unwrap().clone();
+        if stats.total >= packet_count {
+            shared.running.store(false, Ordering::Relaxed);
+            let per = if stats.total > 0 {
+                100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
+            } else { 0.0 };
+            println!("─── SF={sf}  SNR={snr_db_val:.1} dB  {}/{} ok  PER {per:.1}% ───",
+                     stats.ok, stats.total);
+            break;
+        }
+    }
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let sf = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7_u8);
+
+    // Check for --cli flag anywhere in the args list.
+    let cli_mode = args.iter().any(|a| a == "--cli" || a == "-c");
+
+    if cli_mode {
+        // Usage: gui_sim --cli [sf=7] [snr_db=10] [packets=20]
+        let positional: Vec<&str> = args.iter()
+            .filter(|a| !a.starts_with('-') && *a != &args[0])
+            .map(|s| s.as_str())
+            .collect();
+        let sf         = positional.first().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SF);
+        let snr_db     = positional.get(1)  .and_then(|s| s.parse().ok()).unwrap_or(10.0_f32);
+        let packets    = positional.get(2)  .and_then(|s| s.parse().ok()).unwrap_or(20_usize);
+        run_headless(sf, snr_db, packets);
+        return;
+    }
+
+    let sf = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SF);
 
     eframe::run_native(
         "LoRa Link Simulator",
