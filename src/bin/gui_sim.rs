@@ -54,9 +54,10 @@ const DEFAULT_INTERVAL_MS:   u64   = 500;
 /// Tick interval for the stream thread (~60 fps waterfall scroll).
 const TICK: Duration = Duration::from_millis(16);
 
-/// Maximum FFT rows drained from the IQ buffer per tick.
-/// When the buffer is full (interval → 0) this caps the scroll rate.
-const MAX_ROWS_PER_TICK: usize = 4;
+/// Hard cap on FFT rows rendered per tick to prevent runaway scroll at very
+/// high sample rates.  At 4 MHz SR + 1024-pt FFT the natural rate is ~62 rows
+/// per 16 ms tick, which is already visible; this only kicks in above that.
+const MAX_ROWS_PER_TICK: usize = 128;
 
 fn khz_label(v: u32) -> String {
     if v >= 1000 { format!("{}M", v / 1000) } else { format!("{}k", v) }
@@ -108,10 +109,11 @@ fn pad_nibbles(nibbles: &[u8], sf: u8, ldro: bool) -> Vec<u8> {
 
 // ─── Channel ──────────────────────────────────────────────────────────────────
 
-/// Free-running AWGN channel.  TX bursts are injected into the stream;
-/// `read()` drains buffered signal-plus-noise or synthesises pure noise when idle.
+/// Free-running AWGN channel.  Silence and TX bursts are both pushed as
+/// explicit IQ samples; `read()` just drains the pre-filled queue.
 ///
-/// Future device mode: replace `inject` / `read` with SDR driver calls.
+/// Future device mode: replace `push_silence` / `inject` / `read` with SDR
+/// driver calls.
 struct Channel {
     signal_amp:  f32,
     noise_sigma: f32,
@@ -127,6 +129,11 @@ impl Channel {
     fn set_noise_sigma(&mut self, s: f32) { self.noise_sigma = s; }
     fn pending_len(&self) -> usize        { self.pending.len() }
     fn clear(&mut self)                   { self.pending.clear(); }
+
+    /// Push `n` samples of pure AWGN (silence / inter-packet gap) into the stream.
+    fn push_silence(&mut self, n: usize, rng: &mut impl Rng) {
+        for _ in 0..n { self.pending.push_back(self.noise_sample(rng)); }
+    }
 
     /// Scale the TX burst, mix with AWGN, push into the stream, and return
     /// the mixed IQ so the caller can immediately hand it to the RX for stats.
@@ -224,6 +231,7 @@ struct SimShared {
     clear_buf:      AtomicBool,   // flush IQ buffer on settings change
     sf:             Mutex<u8>,
     os_factor:      Mutex<u32>,
+    samp_rate_khz:  Mutex<u32>,
     fft_size:       Mutex<usize>,
     signal_db:      Mutex<f32>,   // signal amplitude in dBFS
     noise_db:       Mutex<f32>,   // noise amplitude in dBFS
@@ -258,8 +266,14 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         b"Hello, LoRa!", b"Rust 2024", b"AWGN channel",
         b"burst test",   b"lora-rs",   b"packet!",
     ];
-    let mut idx         = 0usize;
-    let mut last_packet = Instant::now() - Duration::from_secs(60); // fire immediately
+    let mut idx = 0usize;
+
+    // Virtual sample clock: how many samples have been pushed to the channel.
+    let mut filled_samples:   u64 = 0;
+    // Sample index at which the next packet should be injected (0 = fire immediately).
+    let mut next_packet_at:   u64 = 0;
+    // Detect interval_ms changes so we can reschedule immediately.
+    let mut last_interval_ms: u64 = u64::MAX;
 
     // Read initial settings to build TX / Channel / RX.
     let init_sf        = *shared.sf.lock().unwrap();
@@ -289,18 +303,21 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
             continue;
         }
 
-        // Flush channel on settings change.
+        // Flush channel on settings change; reset virtual clock.
         if shared.clear_buf.swap(false, Ordering::Relaxed) {
             channel.clear();
-            last_packet = Instant::now() - Duration::from_secs(60);
+            filled_samples   = 0;
+            next_packet_at   = 0;
+            last_interval_ms = u64::MAX;
         }
 
-        let sf          = *shared.sf.lock().unwrap();
-        let os_factor   = *shared.os_factor.lock().unwrap();
-        let fft_size    = *shared.fft_size.lock().unwrap();
-        let signal_db   = *shared.signal_db.lock().unwrap();
-        let noise_db    = *shared.noise_db.lock().unwrap();
-        let interval_ms = *shared.interval_ms.lock().unwrap();
+        let sf             = *shared.sf.lock().unwrap();
+        let os_factor      = *shared.os_factor.lock().unwrap();
+        let samp_rate_khz  = *shared.samp_rate_khz.lock().unwrap();
+        let fft_size       = *shared.fft_size.lock().unwrap();
+        let signal_db      = *shared.signal_db.lock().unwrap();
+        let noise_db       = *shared.noise_db.lock().unwrap();
+        let interval_ms    = *shared.interval_ms.lock().unwrap();
 
         // Propagate updated amplitude settings to the channel.
         channel.set_signal_amp(db_to_amp(signal_db));
@@ -322,60 +339,76 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
             fft = planner.plan_fft_forward(fft_size);
         }
 
-        // ── TX: packet scheduler ──────────────────────────────────────────
-        let should_send = if interval_ms == 0 {
-            channel.pending_len() < fft_size * 2
-        } else {
-            last_packet.elapsed().as_millis() as u64 >= interval_ms
-                && channel.pending_len() < fft_size * 16
-        };
+        // ── TX: sample-accurate fill ──────────────────────────────────────
+        // How many samples to generate this tick (matches real sample rate).
+        let samp_rate_hz     = samp_rate_khz as u64 * 1000;
+        let samples_per_tick = (samp_rate_hz as f64 * TICK.as_secs_f64()).round() as u64;
+        let interval_samples = interval_ms * samp_rate_hz / 1000;
 
-        if should_send {
-            last_packet = Instant::now();
-            let payload = payloads[idx % payloads.len()];
-            idx += 1;
+        // When the user changes the interval, reschedule the next packet
+        // immediately rather than waiting out the old silence.
+        if interval_ms != last_interval_ms {
+            last_interval_ms = interval_ms;
+            next_packet_at   = filled_samples;
+        }
 
-            // TX → Channel: inject returns the mixed IQ for immediate RX decode.
-            let iq    = tx.modulate(payload);
-            let mixed = channel.inject(&iq, &mut rng);
+        let target = filled_samples + samples_per_tick;
 
-            // RX: decode the mixed burst for link stats.
-            let result = rx.decode(&mixed);
-            {
-                let mut s = shared.stats.lock().unwrap();
-                s.total += 1;
-                s.last_tx = String::from_utf8_lossy(payload).to_string();
-                if let Some(rx_payload) = &result {
-                    if rx_payload == payload { s.ok += 1; }
-                    s.last_rx = String::from_utf8_lossy(rx_payload).to_string();
-                } else {
-                    s.last_rx = "—".to_string();
-                }
-            }
-            {
-                let ok = result.as_deref() == Some(payload);
-                let entry = LogEntry {
-                    ok,
-                    payload: if ok {
-                        String::from_utf8_lossy(payload).to_string()
+        // Fill the channel up to `target` with silence or signal as scheduled.
+        while filled_samples < target {
+            if next_packet_at <= filled_samples {
+                // ── Inject a packet ───────────────────────────────────────
+                let payload = payloads[idx % payloads.len()];
+                idx += 1;
+
+                let iq    = tx.modulate(payload);
+                let mixed = channel.inject(&iq, &mut rng);
+                filled_samples += iq.len() as u64;
+                // Schedule next packet: gap starts after this packet ends.
+                next_packet_at = filled_samples + interval_samples;
+
+                // RX: decode for link stats.
+                let result = rx.decode(&mixed);
+                {
+                    let mut s = shared.stats.lock().unwrap();
+                    s.total += 1;
+                    s.last_tx = String::from_utf8_lossy(payload).to_string();
+                    if let Some(rx_payload) = &result {
+                        if rx_payload == payload { s.ok += 1; }
+                        s.last_rx = String::from_utf8_lossy(rx_payload).to_string();
                     } else {
-                        result.as_ref()
-                            .map(|p| format!("ERR: {}", String::from_utf8_lossy(p)))
-                            .unwrap_or_else(|| "LOST".to_string())
-                    },
-                };
-                let mut log = shared.log.lock().unwrap();
-                log.push_back(entry);
-                if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
+                        s.last_rx = "—".to_string();
+                    }
+                }
+                {
+                    let ok = result.as_deref() == Some(payload);
+                    let entry = LogEntry {
+                        ok,
+                        payload: if ok {
+                            String::from_utf8_lossy(payload).to_string()
+                        } else {
+                            result.as_ref()
+                                .map(|p| format!("ERR: {}", String::from_utf8_lossy(p)))
+                                .unwrap_or_else(|| "LOST".to_string())
+                        },
+                    };
+                    let mut log = shared.log.lock().unwrap();
+                    log.push_back(entry);
+                    if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
+                }
+            } else {
+                // ── Push silence until next packet or end of tick ─────────
+                let silence_end = next_packet_at.min(target);
+                let n = (silence_end - filled_samples) as usize;
+                channel.push_silence(n, &mut rng);
+                filled_samples += n as u64;
             }
         }
 
-        // ── Channel → display: drain up to MAX_ROWS_PER_TICK FFT windows ─
-        let rows = if channel.pending_len() >= fft_size {
-            MAX_ROWS_PER_TICK.min(channel.pending_len() / fft_size)
-        } else {
-            1  // always emit at least one row; channel fills shortfall with noise
-        };
+        // ── Channel → display: drain exactly one tick's worth of FFT rows ─
+        let rows = ((samples_per_tick as usize / fft_size).max(1))
+            .min(MAX_ROWS_PER_TICK)
+            .min(channel.pending_len() / fft_size + 1);
 
         let mut last_spec: Option<Vec<[f64; 2]>> = None;
         for _ in 0..rows {
@@ -444,11 +477,14 @@ impl GuiApp {
         waterfall_chart.set_link_cursor("lora_link", true, false);
         waterfall_chart.add(waterfall_plot.clone());
 
+        let (eff_sr, _) = effective_sr_and_os(samp_rate_khz, bw_khz);
+
         let shared = Arc::new(SimShared {
             running:        AtomicBool::new(true),
             clear_buf:      AtomicBool::new(false),
             sf:             Mutex::new(sf),
             os_factor:      Mutex::new(os_factor),
+            samp_rate_khz:  Mutex::new(eff_sr),
             fft_size:       Mutex::new(fft_size),
             signal_db:      Mutex::new(signal_db),
             noise_db:       Mutex::new(noise_db),
@@ -493,9 +529,10 @@ impl GuiApp {
         self.samp_rate_khz = eff_sr;
         self.spectrum_chart.set_x_limits([0.0, self.fft_size as f64]);
         self.waterfall_chart.set_x_limits([0.0, self.fft_size as f64]);
-        *self.shared.sf.lock().unwrap()        = self.sf;
-        *self.shared.os_factor.lock().unwrap() = os_factor;
-        *self.shared.fft_size.lock().unwrap()  = self.fft_size;
+        *self.shared.sf.lock().unwrap()            = self.sf;
+        *self.shared.os_factor.lock().unwrap()     = os_factor;
+        *self.shared.samp_rate_khz.lock().unwrap() = eff_sr;
+        *self.shared.fft_size.lock().unwrap()      = self.fft_size;
         self.shared.waterfall_plot.set_freq(self.fft_size as f64 / 2.0);
         self.shared.waterfall_plot.set_bw(self.fft_size as f64);
         *self.shared.stats.lock().unwrap() = Stats::default();
