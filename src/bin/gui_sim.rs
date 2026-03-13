@@ -406,6 +406,28 @@ impl GuiApp {
     }
 }
 
+/// Consume the remaining row space with a zero-height spacer when the next
+/// group won't fully fit, so `horizontal_wrapped` starts a fresh row.
+///
+/// Uses cursor + max_rect to measure actual remaining width, which is more
+/// reliable than `available_width()` inside a wrapped layout.
+fn newline_if_needed(ui: &mut egui::Ui, needed: f32) {
+    let cursor_x = ui.cursor().min.x;
+    let left_x   = ui.max_rect().min.x;
+    let right_x  = ui.max_rect().max.x;
+    // Don't trigger when we're already at (or very close to) the start of a row.
+    // Use 2 × item_spacing as the threshold to handle any post-wrap cursor offset.
+    if cursor_x <= left_x + ui.spacing().item_spacing.x * 2.0 { return; }
+    let remaining = right_x - cursor_x;
+    // Nothing to do if already past the right edge (wrap will happen naturally).
+    if remaining <= 0.0 { return; }
+    if remaining < needed {
+        // Overshoot by 1 px so the cursor lands strictly past right_x, which
+        // guarantees horizontal_wrapped starts a new row for the next widget.
+        ui.allocate_exact_size(egui::vec2(remaining + 1.0, 0.0), egui::Sense::hover());
+    }
+}
+
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.thread_started {
@@ -421,96 +443,124 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 // Pause / Run
+                newline_if_needed(ui, 100.0);
                 if ui.button(if running { "⏸ Pause" } else { "▶ Run" }).clicked() {
                     self.shared.running.store(!running, Ordering::Relaxed);
                 }
 
                 ui.separator();
 
-                // SF
-                ui.label("SF:");
+                // SF — wrapped as an atomic group
                 let mut changed = false;
-                for s in [7u8, 8, 9, 10, 11, 12] {
-                    if ui.selectable_label(self.sf == s, format!("{s}")).clicked() && self.sf != s {
-                        self.sf = s; changed = true;
+                newline_if_needed(ui, 230.0);
+                ui.horizontal(|ui| {
+                    ui.label("SF:");
+                    for s in [7u8, 8, 9, 10, 11, 12] {
+                        if ui.selectable_label(self.sf == s, format!("{s}")).clicked()
+                            && self.sf != s
+                        { self.sf = s; changed = true; }
                     }
-                }
+                });
 
                 ui.separator();
 
                 // Sample rate
-                ui.label("SR:");
-                for &sr in SR_OPTIONS_KHZ {
-                    if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
-                        && self.samp_rate_khz != sr
-                    { self.samp_rate_khz = sr; changed = true; }
-                }
+                newline_if_needed(ui, 270.0);
+                ui.horizontal(|ui| {
+                    ui.label("SR:");
+                    for &sr in SR_OPTIONS_KHZ {
+                        if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
+                            && self.samp_rate_khz != sr
+                        { self.samp_rate_khz = sr; changed = true; }
+                    }
+                });
 
                 ui.separator();
 
                 // Bandwidth + inferred OS factor
-                ui.label("BW:");
-                for &bw in BW_OPTIONS_KHZ {
-                    if ui.selectable_label(self.bw_khz == bw, khz_label(bw)).clicked()
-                        && self.bw_khz != bw
-                    { self.bw_khz = bw; changed = true; }
-                }
-                let (eff_sr, os) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
-                ui.label(if eff_sr != self.samp_rate_khz {
-                    format!(" ×{os}↑")
-                } else {
-                    format!(" ×{os}")
+                newline_if_needed(ui, 250.0);
+                ui.horizontal(|ui| {
+                    ui.label("BW:");
+                    for &bw in BW_OPTIONS_KHZ {
+                        if ui.selectable_label(self.bw_khz == bw, khz_label(bw)).clicked()
+                            && self.bw_khz != bw
+                        { self.bw_khz = bw; changed = true; }
+                    }
+                    let (eff_sr, os) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
+                    ui.label(if eff_sr != self.samp_rate_khz {
+                        format!("×{os}↑")
+                    } else {
+                        format!("×{os}")
+                    });
                 });
 
                 ui.separator();
 
                 // FFT size
-                ui.label("FFT:");
-                for &sz in &[1024usize, 2048, 4096, 8192] {
-                    if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
-                        && self.fft_size != sz
-                    { self.fft_size = sz; changed = true; }
-                }
+                newline_if_needed(ui, 250.0);
+                ui.horizontal(|ui| {
+                    ui.label("FFT:");
+                    for &sz in &[1024usize, 2048, 4096, 8192] {
+                        if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
+                            && self.fft_size != sz
+                        { self.fft_size = sz; changed = true; }
+                    }
+                });
+
                 if changed { self.rebuild_plots(); }
 
                 ui.separator();
 
                 // Signal amplitude
-                ui.label("Sig:");
-                if ui.add(Slider::new(&mut self.signal_db, -40.0..=20.0)
-                    .suffix(" dBFS").step_by(1.0)).changed()
-                {
-                    *self.shared.signal_db.lock().unwrap() = self.signal_db;
-                }
+                newline_if_needed(ui, 175.0);
+                ui.horizontal(|ui| {
+                    ui.label("Sig:");
+                    let h = ui.spacing().interact_size.y;
+                    if ui.add_sized([120.0, h], Slider::new(&mut self.signal_db, -40.0..=20.0)
+                        .suffix(" dBFS").step_by(1.0)).changed()
+                    {
+                        *self.shared.signal_db.lock().unwrap() = self.signal_db;
+                    }
+                });
 
                 ui.separator();
 
                 // Noise amplitude
-                ui.label("Noise:");
-                if ui.add(Slider::new(&mut self.noise_db, -80.0..=0.0)
-                    .suffix(" dBFS").step_by(1.0)).changed()
-                {
-                    *self.shared.noise_db.lock().unwrap() = self.noise_db;
-                }
+                newline_if_needed(ui, 190.0);
+                ui.horizontal(|ui| {
+                    ui.label("Noise:");
+                    let h = ui.spacing().interact_size.y;
+                    if ui.add_sized([120.0, h], Slider::new(&mut self.noise_db, -80.0..=0.0)
+                        .suffix(" dBFS").step_by(1.0)).changed()
+                    {
+                        *self.shared.noise_db.lock().unwrap() = self.noise_db;
+                    }
+                });
 
                 // Inferred SNR label
+                newline_if_needed(ui, 110.0);
                 ui.label(format!("SNR: {:.0} dB", snr_db(self.signal_db, self.noise_db)));
 
                 ui.separator();
 
                 // Packet interval
-                ui.label("Interval:");
-                let mut interval_f = self.interval_ms as f32;
-                if ui.add(Slider::new(&mut interval_f, 0.0..=5000.0)
-                    .suffix(" ms").step_by(50.0)).changed()
-                {
-                    self.interval_ms = interval_f as u64;
-                    *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
-                }
+                newline_if_needed(ui, 220.0);
+                ui.horizontal(|ui| {
+                    ui.label("Interval:");
+                    let h = ui.spacing().interact_size.y;
+                    let mut interval_f = self.interval_ms as f32;
+                    if ui.add_sized([120.0, h], Slider::new(&mut interval_f, 0.0..=5000.0)
+                        .suffix(" ms").step_by(50.0)).changed()
+                    {
+                        self.interval_ms = interval_f as u64;
+                        *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
+                    }
+                });
 
                 ui.separator();
 
                 // Stats
+                newline_if_needed(ui, 500.0);
                 let per = if stats.total > 0 {
                     100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
                 } else { 0.0 };
