@@ -441,17 +441,16 @@ impl eframe::App for GuiApp {
         let stats   = self.shared.stats.lock().unwrap().clone();
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            // ── Row 1: signal parameters ──────────────────────────────────────
             ui.horizontal_wrapped(|ui| {
-                // Pause / Run
-                newline_if_needed(ui, 100.0);
                 if ui.button(if running { "⏸ Pause" } else { "▶ Run" }).clicked() {
                     self.shared.running.store(!running, Ordering::Relaxed);
                 }
 
                 ui.separator();
 
-                // SF — wrapped as an atomic group
                 let mut changed = false;
+
                 newline_if_needed(ui, 230.0);
                 ui.horizontal(|ui| {
                     ui.label("SF:");
@@ -464,7 +463,6 @@ impl eframe::App for GuiApp {
 
                 ui.separator();
 
-                // Sample rate
                 newline_if_needed(ui, 270.0);
                 ui.horizontal(|ui| {
                     ui.label("SR:");
@@ -477,7 +475,6 @@ impl eframe::App for GuiApp {
 
                 ui.separator();
 
-                // Bandwidth + inferred OS factor
                 newline_if_needed(ui, 250.0);
                 ui.horizontal(|ui| {
                     ui.label("BW:");
@@ -496,7 +493,6 @@ impl eframe::App for GuiApp {
 
                 ui.separator();
 
-                // FFT size
                 newline_if_needed(ui, 250.0);
                 ui.horizontal(|ui| {
                     ui.label("FFT:");
@@ -508,11 +504,10 @@ impl eframe::App for GuiApp {
                 });
 
                 if changed { self.rebuild_plots(); }
+            });
 
-                ui.separator();
-
-                // Signal amplitude
-                newline_if_needed(ui, 175.0);
+            // ── Row 2: levels + interval ──────────────────────────────────────
+            ui.horizontal_wrapped(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("Sig:");
                     let h = ui.spacing().interact_size.y;
@@ -525,7 +520,6 @@ impl eframe::App for GuiApp {
 
                 ui.separator();
 
-                // Noise amplitude
                 newline_if_needed(ui, 190.0);
                 ui.horizontal(|ui| {
                     ui.label("Noise:");
@@ -537,13 +531,11 @@ impl eframe::App for GuiApp {
                     }
                 });
 
-                // Inferred SNR label
                 newline_if_needed(ui, 110.0);
                 ui.label(format!("SNR: {:.0} dB", snr_db(self.signal_db, self.noise_db)));
 
                 ui.separator();
 
-                // Packet interval
                 newline_if_needed(ui, 220.0);
                 ui.horizontal(|ui| {
                     ui.label("Interval:");
@@ -556,11 +548,10 @@ impl eframe::App for GuiApp {
                         *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
                     }
                 });
+            });
 
-                ui.separator();
-
-                // Stats
-                newline_if_needed(ui, 500.0);
+            // ── Row 3: stats ──────────────────────────────────────────────────
+            ui.horizontal_wrapped(|ui| {
                 let per = if stats.total > 0 {
                     100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
                 } else { 0.0 };
