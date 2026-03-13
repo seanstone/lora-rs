@@ -65,7 +65,28 @@ fn db_to_amp(db: f32) -> f32 { 10f32.powf(db / 20.0) }
 /// SNR in dB from signal and noise amplitude dBFS values.
 fn snr_db(signal_db: f32, noise_db: f32) -> f32 { signal_db - noise_db }
 
-// ─── TX / RX helpers ─────────────────────────────────────────────────────────
+// ─── TX ───────────────────────────────────────────────────────────────────────
+
+struct Tx {
+    sf:        u8,
+    cr:        u8,
+    os_factor: u32,
+}
+
+impl Tx {
+    fn new(sf: u8, cr: u8, os_factor: u32) -> Self { Self { sf, cr, os_factor } }
+
+    fn modulate(&self, payload: &[u8]) -> Vec<Complex<f32>> {
+        let nibbles   = whiten(payload);
+        let framed    = add_header(&nibbles, false, true, self.cr);
+        let with_crc  = add_crc(&framed, payload, true);
+        let padded    = pad_nibbles(&with_crc, self.sf, false);
+        let codewords = hamming_enc(&padded, self.cr, self.sf);
+        let symbols   = interleave(&codewords, self.cr, self.sf, false);
+        let chirps    = gray_demap(&symbols, self.sf);
+        modulate(&chirps, self.sf, 0x12, 8, self.os_factor)
+    }
+}
 
 fn pad_nibbles(nibbles: &[u8], sf: u8, ldro: bool) -> Vec<u8> {
     let pay_sf    = if ldro { (sf - 2) as usize } else { sf as usize };
@@ -77,68 +98,92 @@ fn pad_nibbles(nibbles: &[u8], sf: u8, ldro: bool) -> Vec<u8> {
     v
 }
 
-fn tx_packet(payload: &[u8], sf: u8, cr: u8, os_factor: u32) -> Vec<Complex<f32>> {
-    let nibbles   = whiten(payload);
-    let framed    = add_header(&nibbles, false, true, cr);
-    let with_crc  = add_crc(&framed, payload, true);
-    let padded    = pad_nibbles(&with_crc, sf, false);
-    let codewords = hamming_enc(&padded, cr, sf);
-    let symbols   = interleave(&codewords, cr, sf, false);
-    let chirps    = gray_demap(&symbols, sf);
-    modulate(&chirps, sf, 0x12, 8, os_factor)
-}
+// ─── Channel ──────────────────────────────────────────────────────────────────
 
-fn rx_packet(iq: &[Complex<f32>], sf: u8, cr: u8, os_factor: u32) -> Option<Vec<u8>> {
-    let sync      = frame_sync(iq, sf, 0x12, 8, os_factor);
-    if !sync.found { return None; }
-    let chirps    = fft_demod(&sync.symbols, sf, os_factor);
-    let symbols   = gray_map(&chirps, sf);
-    let codewords = deinterleave(&symbols, cr, sf, false);
-    let nibbles   = hamming_dec(&codewords, cr, sf);
-    let info      = decode_header(&nibbles, false, 0, 0, false);
-    if !info.valid { return None; }
-    let pay_len     = info.payload_len as usize;
-    let min_nibbles = 2 * pay_len + if info.has_crc { 4 } else { 0 };
-    if info.payload_nibbles.len() < min_nibbles { return None; }
-    let pay_nibbles = &info.payload_nibbles[..2 * pay_len];
-    let payload     = dewhiten(pay_nibbles);
-    if info.has_crc {
-        let crc_nib = &info.payload_nibbles[2 * pay_len..2 * pay_len + 4];
-        if !verify_crc(&payload, crc_nib) { return None; }
-    }
-    Some(payload)
-}
-
-/// Scale signal by `signal_amp` and add complex AWGN with per-component
-/// standard deviation `noise_sigma = noise_amp / sqrt(2)`.
-fn apply_channel(
-    signal:      &[Complex<f32>],
+/// Free-running AWGN channel.  TX bursts are injected into the stream;
+/// `read()` drains buffered signal-plus-noise or synthesises pure noise when idle.
+///
+/// Future device mode: replace `inject` / `read` with SDR driver calls.
+struct Channel {
     signal_amp:  f32,
     noise_sigma: f32,
-    rng:         &mut impl Rng,
-) -> Vec<Complex<f32>> {
-    signal.iter().map(|&s| {
-        let u1 = (rng.random::<f32>() + 1e-7_f32).min(1.0);
-        let u2 = rng.random::<f32>();
-        let re  = (-2.0_f32 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
-        let u3 = (rng.random::<f32>() + 1e-7_f32).min(1.0);
-        let u4 = rng.random::<f32>();
-        let im  = (-2.0_f32 * u3.ln()).sqrt() * (std::f32::consts::TAU * u4).cos();
-        s * signal_amp + Complex::new(re * noise_sigma, im * noise_sigma)
-    }).collect()
+    pending:     VecDeque<Complex<f32>>,
 }
 
-/// Generate `n` samples of pure complex AWGN.
-fn noise_window(n: usize, noise_sigma: f32, rng: &mut impl Rng) -> Vec<Complex<f32>> {
-    (0..n).map(|_| {
-        let u1 = (rng.random::<f32>() + 1e-7_f32).min(1.0);
-        let u2 = rng.random::<f32>();
-        let re  = (-2.0_f32 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
-        let u3 = (rng.random::<f32>() + 1e-7_f32).min(1.0);
-        let u4 = rng.random::<f32>();
-        let im  = (-2.0_f32 * u3.ln()).sqrt() * (std::f32::consts::TAU * u4).cos();
-        Complex::new(re * noise_sigma, im * noise_sigma)
-    }).collect()
+impl Channel {
+    fn new(signal_amp: f32, noise_sigma: f32) -> Self {
+        Self { signal_amp, noise_sigma, pending: VecDeque::new() }
+    }
+
+    fn set_signal_amp(&mut self, a: f32)  { self.signal_amp  = a; }
+    fn set_noise_sigma(&mut self, s: f32) { self.noise_sigma = s; }
+    fn pending_len(&self) -> usize        { self.pending.len() }
+    fn clear(&mut self)                   { self.pending.clear(); }
+
+    /// Scale the TX burst, mix with AWGN, push into the stream, and return
+    /// the mixed IQ so the caller can immediately hand it to the RX for stats.
+    fn inject(&mut self, iq: &[Complex<f32>], rng: &mut impl Rng) -> Vec<Complex<f32>> {
+        let mixed: Vec<_> = iq.iter()
+            .map(|&s| s * self.signal_amp + self.noise_sample(rng))
+            .collect();
+        self.pending.extend(mixed.iter().copied());
+        mixed
+    }
+
+    /// Drain `n` samples from the stream, synthesising pure AWGN for any
+    /// sample that has no pending signal.
+    fn read(&mut self, n: usize, rng: &mut impl Rng) -> Vec<Complex<f32>> {
+        (0..n)
+            .map(|_| self.pending.pop_front().unwrap_or_else(|| self.noise_sample(rng)))
+            .collect()
+    }
+
+    fn noise_sample(&self, rng: &mut impl Rng) -> Complex<f32> {
+        Complex::new(
+            box_muller(rng) * self.noise_sigma,
+            box_muller(rng) * self.noise_sigma,
+        )
+    }
+}
+
+/// Box-Muller: one unit-normal sample from two uniform draws.
+fn box_muller(rng: &mut impl Rng) -> f32 {
+    let u1 = (rng.random::<f32>() + 1e-7_f32).min(1.0);
+    let u2 = rng.random::<f32>();
+    (-2.0_f32 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+}
+
+// ─── RX ───────────────────────────────────────────────────────────────────────
+
+struct Rx {
+    sf:        u8,
+    cr:        u8,
+    os_factor: u32,
+}
+
+impl Rx {
+    fn new(sf: u8, cr: u8, os_factor: u32) -> Self { Self { sf, cr, os_factor } }
+
+    fn decode(&self, iq: &[Complex<f32>]) -> Option<Vec<u8>> {
+        let sync = frame_sync(iq, self.sf, 0x12, 8, self.os_factor);
+        if !sync.found { return None; }
+        let chirps    = fft_demod(&sync.symbols, self.sf, self.os_factor);
+        let symbols   = gray_map(&chirps, self.sf);
+        let codewords = deinterleave(&symbols, self.cr, self.sf, false);
+        let nibbles   = hamming_dec(&codewords, self.cr, self.sf);
+        let info      = decode_header(&nibbles, false, 0, 0, false);
+        if !info.valid { return None; }
+        let pay_len     = info.payload_len as usize;
+        let min_nibbles = 2 * pay_len + if info.has_crc { 4 } else { 0 };
+        if info.payload_nibbles.len() < min_nibbles { return None; }
+        let pay_nibbles = &info.payload_nibbles[..2 * pay_len];
+        let payload     = dewhiten(pay_nibbles);
+        if info.has_crc {
+            let crc_nib = &info.payload_nibbles[2 * pay_len..2 * pay_len + 4];
+            if !verify_crc(&payload, crc_nib) { return None; }
+        }
+        Some(payload)
+    }
 }
 
 // ─── Raw spectrum ─────────────────────────────────────────────────────────────
@@ -197,13 +242,25 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         b"burst test",   b"lora-rs",   b"packet!",
     ];
     let mut idx         = 0usize;
-    let mut iq_buf: VecDeque<Complex<f32>> = VecDeque::new();
     let mut last_packet = Instant::now() - Duration::from_secs(60); // fire immediately
+
+    // Read initial settings to build TX / Channel / RX.
+    let init_sf        = *shared.sf.lock().unwrap();
+    let init_os        = *shared.os_factor.lock().unwrap();
+    let init_signal_db = *shared.signal_db.lock().unwrap();
+    let init_noise_db  = *shared.noise_db.lock().unwrap();
+
+    let mut tx      = Tx::new(init_sf, 4, init_os);
+    let mut channel = Channel::new(
+        db_to_amp(init_signal_db),
+        db_to_amp(init_noise_db) / std::f32::consts::SQRT_2,
+    );
+    let mut rx      = Rx::new(init_sf, 4, init_os);
 
     // FFT state — rebuilt when fft_size changes.
     let mut cur_fft_size = 0usize;
-    let mut hann: Vec<f32>            = Vec::new();
-    let mut fft_buf: Vec<Complex<f32>>= Vec::new();
+    let mut hann: Vec<f32>             = Vec::new();
+    let mut fft_buf: Vec<Complex<f32>> = Vec::new();
     let mut planner = FftPlanner::<f32>::new();
     let mut fft: Arc<dyn rustfft::Fft<f32>> = planner.plan_fft_forward(1);
 
@@ -215,9 +272,9 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
             continue;
         }
 
-        // Flush IQ buffer on settings change.
+        // Flush channel on settings change.
         if shared.clear_buf.swap(false, Ordering::Relaxed) {
-            iq_buf.clear();
+            channel.clear();
             last_packet = Instant::now() - Duration::from_secs(60);
         }
 
@@ -228,8 +285,15 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         let noise_db    = *shared.noise_db.lock().unwrap();
         let interval_ms = *shared.interval_ms.lock().unwrap();
 
-        let signal_amp  = db_to_amp(signal_db);
-        let noise_sigma = db_to_amp(noise_db) / std::f32::consts::SQRT_2;
+        // Propagate updated amplitude settings to the channel.
+        channel.set_signal_amp(db_to_amp(signal_db));
+        channel.set_noise_sigma(db_to_amp(noise_db) / std::f32::consts::SQRT_2);
+
+        // Rebuild TX / RX when SF or os_factor changes.
+        if sf != tx.sf || os_factor != tx.os_factor {
+            tx = Tx::new(sf, 4, os_factor);
+            rx = Rx::new(sf, 4, os_factor);
+        }
 
         // Rebuild FFT plan if size changed.
         if fft_size != cur_fft_size {
@@ -241,14 +305,12 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
             fft = planner.plan_fft_forward(fft_size);
         }
 
-        // ── Packet scheduler ─────────────────────────────────────────────
-        // For interval = 0: keep the buffer primed to avoid any gap.
-        // For interval > 0: inject a packet once per period.
+        // ── TX: packet scheduler ──────────────────────────────────────────
         let should_send = if interval_ms == 0 {
-            iq_buf.len() < fft_size * 2
+            channel.pending_len() < fft_size * 2
         } else {
             last_packet.elapsed().as_millis() as u64 >= interval_ms
-                && iq_buf.len() < fft_size * 16   // don't flood the buffer
+                && channel.pending_len() < fft_size * 16
         };
 
         if should_send {
@@ -256,49 +318,36 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
             let payload = payloads[idx % payloads.len()];
             idx += 1;
 
-            let iq    = tx_packet(payload, sf, 4, os_factor);
-            let noisy = apply_channel(&iq, signal_amp, noise_sigma, &mut rng);
+            // TX → Channel: inject returns the mixed IQ for immediate RX decode.
+            let iq    = tx.modulate(payload);
+            let mixed = channel.inject(&iq, &mut rng);
 
-            // Decode for stats (on the noisy IQ before buffering).
-            let result = rx_packet(&noisy, sf, 4, os_factor);
+            // RX: decode the mixed burst for link stats.
+            let result = rx.decode(&mixed);
             {
                 let mut s = shared.stats.lock().unwrap();
                 s.total += 1;
                 s.last_tx = String::from_utf8_lossy(payload).to_string();
-                if let Some(rx) = &result {
-                    if rx == payload { s.ok += 1; }
-                    s.last_rx = String::from_utf8_lossy(rx).to_string();
+                if let Some(rx_payload) = &result {
+                    if rx_payload == payload { s.ok += 1; }
+                    s.last_rx = String::from_utf8_lossy(rx_payload).to_string();
                 } else {
                     s.last_rx = "—".to_string();
                 }
             }
-
-            iq_buf.extend(noisy.iter().copied());
         }
 
-        // ── Stream: drain up to MAX_ROWS_PER_TICK windows ────────────────
-        // If the buffer is empty, emit one pure-noise window so the
-        // waterfall keeps scrolling at a constant rate.
-        let mut last_spec: Option<Vec<[f64; 2]>> = None;
-
-        let rows = if iq_buf.len() >= fft_size {
-            MAX_ROWS_PER_TICK.min(iq_buf.len() / fft_size)
+        // ── Channel → display: drain up to MAX_ROWS_PER_TICK FFT windows ─
+        let rows = if channel.pending_len() >= fft_size {
+            MAX_ROWS_PER_TICK.min(channel.pending_len() / fft_size)
         } else {
-            0
+            1  // always emit at least one row; channel fills shortfall with noise
         };
 
+        let mut last_spec: Option<Vec<[f64; 2]>> = None;
         for _ in 0..rows {
-            let window: Vec<Complex<f32>> =
-                (0..fft_size).map(|_| iq_buf.pop_front().unwrap()).collect();
-            let spec = spectrum_window(&window, &hann, &mut fft_buf, fft.as_ref());
-            shared.waterfall_plot.update(spec.clone());
-            last_spec = Some(spec);
-        }
-
-        if rows == 0 {
-            // Buffer empty — emit one noise window to keep the waterfall rolling.
-            let window = noise_window(fft_size, noise_sigma, &mut rng);
-            let spec = spectrum_window(&window, &hann, &mut fft_buf, fft.as_ref());
+            let window = channel.read(fft_size, &mut rng);
+            let spec   = spectrum_window(&window, &hann, &mut fft_buf, fft.as_ref());
             shared.waterfall_plot.update(spec.clone());
             last_spec = Some(spec);
         }
