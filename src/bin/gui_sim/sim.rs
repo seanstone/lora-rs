@@ -135,11 +135,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             // Stale result from before a reset — silently discard.
         }
 
-        // Keep TX_PIPELINE_DEPTH jobs dispatched ahead of the queue.
-        while tx_queue.len() + jobs_in_flight < TX_PIPELINE_DEPTH {
-            dispatch_tx!(sf, os_factor);
-        }
-
         // ── Push packets into the channel ─────────────────────────────────
         // Hard cap: never let the channel buffer grow beyond 4 ticks of samples
         // (prevents tx_count racing ahead of rx_count at interval=0).
@@ -174,6 +169,13 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             }
         }
         shared.tx_starved.store(starved, Ordering::Relaxed);
+
+        // Replenish the pipeline based on what the push loop just consumed.
+        // Dispatch must happen *after* the push so we see the post-push queue
+        // depth and send exactly as many new jobs as were consumed this tick.
+        while tx_queue.len() + jobs_in_flight < TX_PIPELINE_DEPTH {
+            dispatch_tx!(sf, os_factor);
+        }
 
         // ── Channel tick: produce one tick's worth of mixed samples ───────
         let n     = samples_per_tick as usize;
