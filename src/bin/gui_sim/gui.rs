@@ -272,10 +272,14 @@ impl eframe::App for GuiApp {
                     if ui.selectable_label(sim_mode, "Sim").clicked() && use_uhd {
                         self.shared.use_uhd.store(false, Ordering::Relaxed);
                         self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                        *self.shared.stats.lock().unwrap() = Stats::default();
+                        self.shared.log.lock().unwrap().clear();
                     }
                     if ui.selectable_label(use_uhd, "UHD").clicked() && sim_mode {
                         self.shared.use_uhd.store(true, Ordering::Relaxed);
                         self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                        *self.shared.stats.lock().unwrap() = Stats::default();
+                        self.shared.log.lock().unwrap().clear();
                     }
 
                     if !sim_mode {

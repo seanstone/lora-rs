@@ -125,6 +125,10 @@ pub(crate) fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimS
     let mut buffer:  Vec<Complex<f32>> = Vec::new();
     let mut next_seq: u16 = 0;
     let mut rx_gen:  u64 = 0;
+    // After a reset the first decoded packet re-synchronises next_seq without
+    // counting any gap (stale hardware-buffered packets would otherwise look
+    // like spurious loss).
+    let mut resync = true;
 
     while let Ok(job) = jobs.recv() {
         // Re-create decoder on settings change.
@@ -141,6 +145,7 @@ pub(crate) fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimS
             rx_gen   = job.tx_gen;
             buffer.clear();
             next_seq = 0;
+            resync   = true;
         }
 
         buffer.extend_from_slice(&job.samples);
@@ -175,8 +180,10 @@ pub(crate) fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimS
                     let text = String::from_utf8_lossy(&payload[2..]).to_string();
 
                     // Detect lost packets via sequence gap.
+                    // Skip on first packet after a reset: stale hardware-
+                    // buffered samples would produce a spurious gap.
                     let gap = seq.wrapping_sub(next_seq);
-                    if gap > 0 && gap <= 1000 {
+                    if !resync && gap > 0 && gap <= 1000 {
                         let mut s = shared.stats.lock().unwrap();
                         s.rx_lost += gap as usize;
                         drop(s);
@@ -187,6 +194,7 @@ pub(crate) fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimS
                         });
                         if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
                     }
+                    resync   = false;
                     next_seq = seq.wrapping_add(1);
 
                     {
