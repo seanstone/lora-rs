@@ -43,7 +43,7 @@ pub(crate) const DEFAULT_SAMP_RATE_KHZ: u32     = 1000;
 pub(crate) const DEFAULT_BW_KHZ:        u32     = 250;
 pub(crate) const DEFAULT_FFT_SIZE:      usize   = 1024;
 pub(crate) const DEFAULT_SIGNAL_DB:     f32     = -20.0;
-pub(crate) const DEFAULT_NOISE_DB:      f32     = -35.0;
+pub(crate) const DEFAULT_NOISE_DB:      f32     = -60.0;
 pub(crate) const DEFAULT_INTERVAL_MS:   u64     = 500;
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────

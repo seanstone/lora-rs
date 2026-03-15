@@ -122,9 +122,15 @@ impl Chart {
                     .collect::<Vec<_>>()
                     .join("")
             });
-        // Conditionally attach the freq-aligned grid spacer.
+        // Conditionally attach grid spacers.
         let plot = if let Some((offset, scale)) = x_freq {
             plot.x_grid_spacer(move |input| x_grid_freq(input, offset, scale))
+        } else {
+            plot
+        };
+        let y_time = self.y_time_secs;
+        let plot = if let Some(total) = y_time {
+            plot.y_grid_spacer(move |input| y_grid_time(input, total))
         } else {
             plot
         };
@@ -219,6 +225,46 @@ impl Chart {
         self.last_x_bounds = xb;
         self.last_y_bounds = yb;
     }
+}
+
+/// Y grid spacer for time-display mode.
+/// Snaps grid marks to nice time steps (e.g. 100ms, 500ms, 1s, 2s).
+/// `total_secs` is the time represented by Y=0..1.
+fn y_grid_time(input: GridInput, total_secs: f64) -> Vec<GridMark> {
+    let (y_min, y_max) = input.bounds;
+    let t_min = y_min * total_secs;
+    let t_max = y_max * total_secs;
+    let span  = (t_max - t_min).abs();
+
+    // Nice major step candidates in seconds, largest first.
+    let candidates = [
+        300.0_f64, 120.0, 60.0, 30.0, 10.0, 5.0, 2.0, 1.0,
+        0.5, 0.25, 0.1, 0.05, 0.025, 0.01,
+    ];
+    let major_s = candidates.iter().copied()
+        .find(|&s| s <= span / 3.0)
+        .unwrap_or(candidates[candidates.len() - 1]);
+    let minor_s = major_s / 5.0;
+
+    let major_y = major_s / total_secs;
+    let minor_y = minor_s / total_secs;
+
+    let mut marks = vec![];
+    let i_min = (t_min / major_s).floor() as i64;
+    let i_max = (t_max / major_s).ceil()  as i64;
+    for i in i_min..=i_max {
+        let y = i as f64 * major_s / total_secs;
+        marks.push(GridMark { value: y, step_size: major_y });
+    }
+    let i_min = (t_min / minor_s).floor() as i64;
+    let i_max = (t_max / minor_s).ceil()  as i64;
+    for i in i_min..=i_max {
+        if i % 5 == 0 { continue; }
+        let y = i as f64 * minor_s / total_secs;
+        marks.push(GridMark { value: y, step_size: minor_y });
+    }
+    marks.retain(|m| m.value >= 0.0 && m.value <= 1.0);
+    marks
 }
 
 /// X grid spacer for frequency-display mode.
