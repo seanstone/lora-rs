@@ -82,8 +82,13 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     std::thread::spawn(move || tx_worker(tx_job_recv, tx_res_send));
 
     // Display thread is only needed in GUI mode.
-    let disp_send: Option<std::sync::mpsc::Sender<DisplayJob>> = if ctx.is_some() {
-        let (tx, rx) = std::sync::mpsc::channel::<DisplayJob>();
+    // Bounded so the backlog never grows beyond ~4 ticks of windows.  At 4 MHz
+    // the sim loop sends ~62 windows/tick; 256 slots caps the pipeline delay to
+    // ≤4 ticks (~64 ms).  Excess windows are silently dropped — the waterfall
+    // may skip frames when the worker is busy but the gain/signal changes remain
+    // visible within one or two ticks rather than building up seconds of lag.
+    let disp_send: Option<std::sync::mpsc::SyncSender<DisplayJob>> = if ctx.is_some() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DisplayJob>(256);
         { let s = shared.clone(); std::thread::spawn(move || display_worker(rx, s)); }
         Some(tx)
     } else {
@@ -96,6 +101,10 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     // device was opened with — if they change we discard the cache.
     #[cfg(feature = "uhd")]
     let mut parked_uhd: Option<(Box<dyn Driver>, String)> = None;
+    // Args string the currently-active UHD driver was opened with.  Used to
+    // distinguish a fast SR/BW reconfigure (same args) from a full re-open.
+    #[cfg(feature = "uhd")]
+    let mut active_uhd_args: String = String::new();
 
     // Build a numbered payload: [seq_le16][text].
     macro_rules! dispatch_tx {
@@ -130,35 +139,45 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                     let use_uhd = shared.use_uhd.load(Ordering::Relaxed);
                     let cur_args = shared.uhd_args.lock().unwrap().clone();
                     if use_uhd {
-                        // ── Activate UHD ────────────────────────────────────
+                        // ── Activate / reconfigure UHD ───────────────────────
                         let freq  = *shared.uhd_freq_hz.lock().unwrap();
                         let rxg   = *shared.uhd_rx_gain_db.lock().unwrap();
                         let txg   = *shared.uhd_tx_gain_db.lock().unwrap();
                         let sr_hz = *shared.samp_rate_khz.lock().unwrap() as f64 * 1000.0;
                         let bw_hz = sr_hz / *shared.os_factor.lock().unwrap() as f64;
 
-                        let reuse = parked_uhd.as_ref()
-                            .map(|(_, args)| args == &cur_args)
-                            .unwrap_or(false);
-
-                        if reuse {
-                            let (mut dev, _) = parked_uhd.take().unwrap();
-                            dev.unpark(freq, sr_hz, bw_hz, rxg, txg);
-                            driver = dev;
+                        if driver.is_parkable() && active_uhd_args == cur_args {
+                            // UHD already active with the same args (e.g. SR/BW
+                            // changed) — stop streaming, apply new rates, restart.
+                            // This avoids a full close+reopen which would race
+                            // with the background uhd_glue_close() thread.
+                            driver.park();
+                            driver.unpark(freq, sr_hz, bw_hz, rxg, txg);
                         } else {
-                            parked_uhd = None; // drop stale cached device
-                            driver = Box::new(Channel::new(0.0, 1.0)); // close current first
-                            shared.uhd_loading.store(true, Ordering::Relaxed);
-                            if let Some(ref c) = ctx { c.request_repaint(); }
-                            let result = UhdDevice::new(&cur_args, freq, sr_hz, bw_hz, rxg, txg);
-                            shared.uhd_loading.store(false, Ordering::Relaxed);
-                            match result {
-                                Ok(dev) => driver = Box::new(dev),
-                                Err(e)  => {
-                                    eprintln!("[uhd] open failed: {e} — falling back to sim");
-                                    shared.use_uhd.store(false, Ordering::Relaxed);
+                            let reuse = parked_uhd.as_ref()
+                                .map(|(_, args)| args == &cur_args)
+                                .unwrap_or(false);
+
+                            if reuse {
+                                let (mut dev, _) = parked_uhd.take().unwrap();
+                                dev.unpark(freq, sr_hz, bw_hz, rxg, txg);
+                                driver = dev;
+                            } else {
+                                parked_uhd = None; // drop stale cached device
+                                driver = Box::new(Channel::new(0.0, 1.0)); // close current first
+                                shared.uhd_loading.store(true, Ordering::Relaxed);
+                                if let Some(ref c) = ctx { c.request_repaint(); }
+                                let result = UhdDevice::new(&cur_args, freq, sr_hz, bw_hz, rxg, txg);
+                                shared.uhd_loading.store(false, Ordering::Relaxed);
+                                match result {
+                                    Ok(dev) => driver = Box::new(dev),
+                                    Err(e)  => {
+                                        eprintln!("[uhd] open failed: {e} — falling back to sim");
+                                        shared.use_uhd.store(false, Ordering::Relaxed);
+                                    }
                                 }
                             }
+                            active_uhd_args = cur_args;
                         }
                         last_uhd_rx_gain = f64::NAN;
                         last_uhd_tx_gain = f64::NAN;
@@ -297,8 +316,22 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
 
         if let Some(ref ds) = disp_send {
             for i in 0..rows {
+                let is_last = i + 1 == rows;
                 let window = mixed[i * fft_size..(i + 1) * fft_size].to_vec();
-                let _ = ds.send((window, i + 1 == rows));
+                if is_last {
+                    // Always deliver the last window so the spectrum peak-hold
+                    // updates every tick.  A brief block (≤ one slot drain
+                    // ≈ 200 µs) is acceptable here.
+                    let _ = ds.send((window, true));
+                } else if ds.try_send((window, false)).is_err() {
+                    // Channel full — drop remaining waterfall rows for this tick
+                    // but still deliver the is_last window above on the next
+                    // iteration (i will reach rows-1).
+                    // Jump straight to the last window instead of breaking.
+                    let last_window = mixed[(rows - 1) * fft_size..rows * fft_size].to_vec();
+                    let _ = ds.send((last_window, true));
+                    break;
+                }
             }
         }
 

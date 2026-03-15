@@ -140,6 +140,16 @@ impl GuiApp {
     fn rebuild_plots(&mut self) {
         let (eff_sr, os_factor) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
         self.samp_rate_khz = eff_sr;
+
+        // Capture old hardware-relevant values *before* updating shared state
+        // so we can detect whether a hardware reconfigure is actually needed.
+        #[cfg(feature = "uhd")]
+        let uhd_hw_changed = self.shared.use_uhd.load(Ordering::Relaxed) && {
+            let old_sr = *self.shared.samp_rate_khz.lock().unwrap();
+            let old_os = *self.shared.os_factor.lock().unwrap();
+            eff_sr != old_sr || os_factor != old_os
+        };
+
         self.spectrum_chart.set_x_limits([0.0, self.fft_size as f64]);
         self.waterfall_chart.set_x_limits([0.0, self.fft_size as f64]);
         *self.shared.sf.lock().unwrap()            = self.sf;
@@ -151,6 +161,12 @@ impl GuiApp {
         *self.shared.stats.lock().unwrap() = Stats::default();
         self.shared.log.lock().unwrap().clear();
         self.shared.clear_buf.store(true, Ordering::Relaxed);
+        // Only trigger a hardware rebuild when the UHD sample rate or bandwidth
+        // actually changes.  SF and FFT-size changes don't affect hardware.
+        #[cfg(feature = "uhd")]
+        if uhd_hw_changed {
+            self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+        }
     }
 }
 

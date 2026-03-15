@@ -71,22 +71,20 @@ impl WaterfallPlot {
                     ColorImage::new([width, height], vec![Color32::BLACK; width * height]);
             }
         }
-        *self.spectrum.lock().unwrap() = spectrum.clone();
-
         let mut img    = self.image.lock().unwrap();
         let w          = *self.width.lock().unwrap();
         let h          = *self.height.lock().unwrap();
         let reference  = self.reference;
 
-        // Scroll: copy each row down one position.
-        for y in (1..h).rev() {
-            let row = img.pixels[(y - 1) * w..y * w].to_vec();
-            img.pixels[y * w..(y + 1) * w].copy_from_slice(&row);
-        }
+        // Scroll all rows down one position — single in-place memmove, no allocations.
+        img.pixels.copy_within(0..(h - 1) * w, w);
         // Insert new row at top.
         for (x, &[_, power]) in spectrum.iter().enumerate() {
             img.pixels[x] = Self::colormap_viridis(((power - reference) / 80.0) as f32);
         }
+        drop(img);
+
+        *self.spectrum.lock().unwrap() = spectrum;
     }
 
     pub fn set_freq(&self, freq: f64) { *self.freq.lock().unwrap() = freq; }
@@ -96,7 +94,9 @@ impl WaterfallPlot {
 impl Plottable for WaterfallPlot {
     fn plot(&self, plot_ui: &mut PlotUi<'_>) {
         let mut tex_lock = self.texture.lock().unwrap();
-        let img = self.image.lock().unwrap().clone();
+        // Clone while holding the image lock for the minimum time so the
+        // display_worker is not blocked while egui uploads the texture.
+        let img = { self.image.lock().unwrap().clone() };
 
         if let Some(tex) = tex_lock.as_mut() {
             tex.set(img, TextureOptions::default());
