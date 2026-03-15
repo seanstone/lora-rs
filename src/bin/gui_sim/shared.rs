@@ -39,6 +39,8 @@ pub(crate) struct SimShared {
     pub uhd_tx_gain_db:  Mutex<f64>,
     /// Set to true to ask the sim loop to tear down and re-open the UHD device.
     pub rebuild_driver:  AtomicBool,
+    /// True while UHD device initialisation is in progress.
+    pub uhd_loading:     AtomicBool,
 }
 
 #[derive(Default, Clone)]

@@ -90,6 +90,7 @@ impl GuiApp {
             uhd_rx_gain_db: Mutex::new(40.0),
             uhd_tx_gain_db: Mutex::new(40.0),
             rebuild_driver: AtomicBool::new(false),
+            uhd_loading:    AtomicBool::new(false),
         });
 
         Self {
@@ -362,6 +363,13 @@ impl eframe::App for GuiApp {
 
             // ── Row 3: buffer status ──────────────────────────────────────────
             ui.horizontal(|ui| {
+                #[cfg(feature = "uhd")]
+                if self.shared.uhd_loading.load(Ordering::Relaxed) {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Opening USRP…");
+                    return;
+                }
+
                 let lag_ms    = f32::from_bits(self.shared.buf_lag_ms  .load(Ordering::Relaxed));
                 let overflow  = self.shared.buf_overflow .load(Ordering::Relaxed);
                 let underflow = self.shared.buf_underflow.load(Ordering::Relaxed);

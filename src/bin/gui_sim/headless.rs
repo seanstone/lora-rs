@@ -61,6 +61,7 @@ pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
         uhd_rx_gain_db: Mutex::new(40.0),
         uhd_tx_gain_db: Mutex::new(40.0),
         rebuild_driver: AtomicBool::new(false),
+        uhd_loading:    AtomicBool::new(false),
     });
 
     { let s = shared.clone(); std::thread::spawn(move || sim_loop(s, None)); }

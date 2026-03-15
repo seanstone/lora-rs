@@ -147,7 +147,11 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                         } else {
                             parked_uhd = None; // drop stale cached device
                             driver = Box::new(Channel::new(0.0, 1.0)); // close current first
-                            match UhdDevice::new(&cur_args, freq, sr_hz, bw_hz, rxg, txg) {
+                            shared.uhd_loading.store(true, Ordering::Relaxed);
+                            if let Some(ref c) = ctx { c.request_repaint(); }
+                            let result = UhdDevice::new(&cur_args, freq, sr_hz, bw_hz, rxg, txg);
+                            shared.uhd_loading.store(false, Ordering::Relaxed);
+                            match result {
                                 Ok(dev) => driver = Box::new(dev),
                                 Err(e)  => {
                                     eprintln!("[uhd] open failed: {e} — falling back to sim");
