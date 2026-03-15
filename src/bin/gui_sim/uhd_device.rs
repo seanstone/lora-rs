@@ -172,12 +172,19 @@ impl Driver for UhdDevice {
     }
 
     /// Block until at least `n` received samples are available, then drain them.
+    ///
+    /// Any backlog beyond `n` is discarded so we always return the freshest
+    /// samples.  Without this, processing overhead causes the buffer to grow
+    /// steadily (the hardware delivers samples slightly faster than the sim
+    /// loop drains them), producing seconds of latency over time.
     fn tick(&mut self, n: usize) -> Vec<Complex<f32>> {
         loop {
             if self.rx_buffer.lock().unwrap().len() >= n { break; }
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
         let mut buf = self.rx_buffer.lock().unwrap();
+        let discard = buf.len().saturating_sub(n);
+        if discard > 0 { buf.drain(..discard); }
         buf.drain(..n).collect()
     }
 
