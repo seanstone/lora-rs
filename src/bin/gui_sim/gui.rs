@@ -394,14 +394,7 @@ impl eframe::App for GuiApp {
 
             // ── Row 3: buffer status ──────────────────────────────────────────
             ui.horizontal(|ui| {
-                #[cfg(feature = "uhd")]
-                if self.shared.uhd_loading.load(Ordering::Relaxed) {
-                    ui.add(egui::Spinner::new());
-                    ui.label("Opening USRP…");
-                    return;
-                }
-
-        let lag_ms    = f32::from_bits(self.shared.buf_lag_ms  .load(Ordering::Relaxed));
+                let lag_ms    = f32::from_bits(self.shared.buf_lag_ms  .load(Ordering::Relaxed));
                 let overflow  = self.shared.buf_overflow .load(Ordering::Relaxed);
                 let underflow = self.shared.buf_underflow.load(Ordering::Relaxed);
                 let tx_starved = self.shared.tx_starved  .load(Ordering::Relaxed);
@@ -488,6 +481,21 @@ impl eframe::App for GuiApp {
                 self.spectrum_chart .clear_x_freq_display();
                 self.waterfall_chart.clear_x_freq_display();
             }
+        }
+
+        // ── "Opening USRP…" modal overlay ─────────────────────────────────────
+        #[cfg(feature = "uhd")]
+        if self.shared.uhd_loading.load(Ordering::Relaxed) {
+            egui::Modal::new(egui::Id::new("uhd_loading_modal")).show(ctx, |ui| {
+                ui.set_min_width(220.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    ui.add(egui::Spinner::new().size(32.0));
+                    ui.add_space(6.0);
+                    ui.heading("Opening USRP…");
+                    ui.add_space(8.0);
+                });
+            });
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
