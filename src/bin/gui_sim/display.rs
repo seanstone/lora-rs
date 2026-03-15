@@ -53,6 +53,7 @@ pub(crate) fn display_worker(jobs: std::sync::mpsc::Receiver<DisplayJob>, shared
             fft = planner.plan_fft_forward(fft_size);
             peak.clear();
         }
+
         let spec = spectrum_window(&window, &hann, &mut fft_buf, fft.as_ref());
         shared.waterfall_plot.update(spec.clone());
 

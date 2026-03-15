@@ -63,6 +63,19 @@ pub(crate) fn db_to_amp(db: f32) -> f32 { 10f32.powf(db / 20.0) }
 /// SNR in dB from signal and noise amplitude dBFS values.
 pub(crate) fn snr_db(signal_db: f32, noise_db: f32) -> f32 { signal_db - noise_db }
 
+/// Pre-assigned total time span for the waterfall Y axis, snapped to a nice
+/// round value so the label is immediately correct with no settling time.
+/// Computed from the nominal scroll rate (TICK / rows_per_tick).
+/// Waterfall height in rows.
+pub(crate) const WATERFALL_HEIGHT: usize = 512;
+
+pub(crate) fn waterfall_total_secs(samp_rate_khz: u32, fft_size: usize) -> f64 {
+    // Exact signal time represented by a full waterfall: one row = one FFT
+    // window = fft_size / samp_rate seconds.  No rounding — even a few percent
+    // error shifts grid ticks away from known packet-interval markers.
+    WATERFALL_HEIGHT as f64 * fft_size as f64 / (samp_rate_khz as f64 * 1000.0)
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 fn main() {

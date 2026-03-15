@@ -20,6 +20,9 @@ pub struct Chart {
     /// When Some, x-axis labels show MHz instead of bin indices.
     /// (offset_mhz, scale_mhz_per_bin) where freq = offset + bin * scale.
     x_freq:        Option<(f64, f64)>,
+    /// When Some, y-axis labels show elapsed time instead of raw [0,1] values.
+    /// Value is the total time in seconds represented by Y=0..1.
+    y_time_secs:   Option<f64>,
 }
 
 impl Chart {
@@ -38,6 +41,7 @@ impl Chart {
             link_axis:     (Id::new(""), Vec2b::new(false, false)),
             link_cursor:   (Id::new(""), Vec2b::new(false, false)),
             x_freq:        None,
+            y_time_secs:   None,
         }
     }
 
@@ -50,6 +54,12 @@ impl Chart {
     }
 
     pub fn clear_x_freq_display(&mut self) { self.x_freq = None; }
+
+    /// Set total elapsed time (seconds) that the waterfall Y=[0,1] span represents.
+    /// Tick labels will render as "Xms" or "X.Xs".
+    pub fn set_y_time_display(&mut self, total_secs: f64) {
+        self.y_time_secs = Some(total_secs);
+    }
 
     pub fn add(&mut self, item: Arc<dyn Plottable>) {
         self.plots.lock().unwrap().push(item);
@@ -99,7 +109,7 @@ impl Chart {
             .legend(Legend::default())
             .show_axes(true)
             .custom_x_axes(self.x_axes())
-            .custom_y_axes(Self::y_axes())
+            .custom_y_axes(self.y_axes())
             .show_grid(true)
             .allow_drag(false)
             .allow_zoom(true)
@@ -137,9 +147,17 @@ impl Chart {
         vec![AxisHints::new_x().formatter(fmt).placement(egui_plot::VPlacement::Bottom)]
     }
 
-    fn y_axes() -> Vec<AxisHints<'static>> {
-        let fmt = |mark: GridMark, _: &RangeInclusive<f64>| format!("{:.0}", mark.value);
-        vec![AxisHints::new_y().formatter(fmt).min_thickness(40.0)]
+    fn y_axes(&self) -> Vec<AxisHints<'static>> {
+        let time_total = self.y_time_secs;
+        let fmt = move |mark: GridMark, _: &RangeInclusive<f64>| match time_total {
+            Some(total) => {
+                let secs = mark.value * total;
+                if secs < 1.0 { format!("{:.0}ms", secs * 1000.0) }
+                else          { format!("{:.1}s",  secs) }
+            }
+            None => format!("{:.0}", mark.value),
+        };
+        vec![AxisHints::new_y().formatter(fmt).min_thickness(50.0)]
     }
 
     fn handle_input(

@@ -19,7 +19,7 @@ pub struct WaterfallPlot {
 impl WaterfallPlot {
     pub fn new(name: &str, spectrum: Vec<[f64; 2]>, reference: f64) -> Arc<Self> {
         let width  = spectrum.len().max(1);
-        let height = 256;
+        let height = 512;
         let image  = ColorImage::new([width, height], vec![Color32::BLACK; width * height]);
         Arc::new(Self {
             name: name.to_string(),

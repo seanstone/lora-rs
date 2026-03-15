@@ -96,6 +96,10 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     };
 
     let mut driver: Box<dyn Driver> = make_driver(&shared);
+    // Samples not yet consumed by a complete FFT window, carried across ticks.
+    // Without this, floor(n/fft_size) truncation discards up to fft_size-1
+    // samples per tick, making the display run slower than signal time.
+    let mut display_carry: Vec<rustfft::num_complex::Complex<f32>> = Vec::new();
     // Parked UHD device kept alive while the sim channel is active so it can
     // be resumed without re-opening the hardware.  The String is the args the
     // device was opened with — if they change we discard the cache.
@@ -203,6 +207,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                 driver.clear();
             }
             tx_queue.clear();
+            display_carry.clear();
             while tx_res_recv.try_recv().is_ok() {}
             jobs_in_flight   = 0;
             produced_samples = 0;
@@ -310,35 +315,43 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         });
 
         // ── Mixed samples → display thread ───────────────────────────────
-        let target_rows = (n / fft_size).max(1).min(MAX_ROWS_PER_TICK);
-        let avail_rows  = mixed.len() / fft_size;
-        let rows        = target_rows.min(avail_rows);
+        // Prepend carry from last tick so samples straddling tick boundaries
+        // form complete FFT windows.  Without this, floor(n/fft_size) truncation
+        // discards up to fft_size-1 samples per tick, causing the waterfall to
+        // scroll slower than signal time by up to 2× for large FFT sizes.
+        display_carry.extend_from_slice(&mixed);
+        let avail_rows = display_carry.len() / fft_size;
+        let rows       = avail_rows.min(MAX_ROWS_PER_TICK);
 
         if let Some(ref ds) = disp_send {
-            for i in 0..rows {
-                let is_last = i + 1 == rows;
-                let window = mixed[i * fft_size..(i + 1) * fft_size].to_vec();
-                if is_last {
-                    // Always deliver the last window so the spectrum peak-hold
-                    // updates every tick.  A brief block (≤ one slot drain
-                    // ≈ 200 µs) is acceptable here.
-                    let _ = ds.send((window, true));
-                } else if ds.try_send((window, false)).is_err() {
-                    // Channel full — drop remaining waterfall rows for this tick
-                    // but still deliver the is_last window above on the next
-                    // iteration (i will reach rows-1).
-                    // Jump straight to the last window instead of breaking.
-                    let last_window = mixed[(rows - 1) * fft_size..rows * fft_size].to_vec();
-                    let _ = ds.send((last_window, true));
-                    break;
+            if rows > 0 {
+                for i in 0..rows {
+                    let is_last = i + 1 == rows;
+                    let window = display_carry[i * fft_size..(i + 1) * fft_size].to_vec();
+                    if is_last {
+                        let _ = ds.send((window, true));
+                    } else if ds.try_send((window, false)).is_err() {
+                        let last = display_carry[(rows-1)*fft_size..rows*fft_size].to_vec();
+                        let _ = ds.send((last, true));
+                        break;
+                    }
                 }
+            } else {
+                // Accumulating — no complete window yet.  Send a silent is_last
+                // so the spectrum plot still refreshes this tick.
+                let len = display_carry.len().min(fft_size);
+                let mut w = display_carry[..len].to_vec();
+                w.resize(fft_size, rustfft::num_complex::Complex::new(0.0, 0.0));
+                let _ = ds.send((w, true));
             }
         }
+        // Retain only the unconsumed tail for the next tick.
+        display_carry.drain(..rows * fft_size);
 
         // ── Buffer status ─────────────────────────────────────────────────
         let pending   = driver.pending_samples();
         let lag_ms    = pending as f32 * 1000.0 / samp_rate_hz as f32;
-        let overflow  = avail_rows > target_rows * 8;
+        let overflow  = mixed.len() / fft_size > (n / fft_size).max(1) * 8;
         let underflow = avail_rows == 0;
         shared.buf_lag_ms   .store(lag_ms.to_bits(), Ordering::Relaxed);
         shared.buf_overflow .store(overflow,          Ordering::Relaxed);
