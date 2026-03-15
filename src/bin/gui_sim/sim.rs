@@ -91,6 +91,11 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     };
 
     let mut driver: Box<dyn Driver> = make_driver(&shared);
+    // Parked UHD device kept alive while the sim channel is active so it can
+    // be resumed without re-opening the hardware.  The String is the args the
+    // device was opened with — if they change we discard the cache.
+    #[cfg(feature = "uhd")]
+    let mut parked_uhd: Option<(Box<dyn Driver>, String)> = None;
 
     // Build a numbered payload: [seq_le16][text].
     macro_rules! dispatch_tx {
@@ -119,10 +124,57 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         let should_clear   = shared.clear_buf.swap(false, Ordering::Relaxed);
         if should_rebuild || should_clear {
             if should_rebuild {
-                // Drop the old driver first so its UHD handles are closed
-                // before make_driver opens new ones (C glue uses global state).
-                driver = Box::new(Channel::new(0.0, 1.0));
-                driver = make_driver(&shared);
+                #[cfg(feature = "uhd")]
+                {
+                    let use_uhd = shared.use_uhd.load(Ordering::Relaxed);
+                    let cur_args = shared.uhd_args.lock().unwrap().clone();
+                    if use_uhd {
+                        // ── Activate UHD ────────────────────────────────────
+                        let freq  = *shared.uhd_freq_hz.lock().unwrap();
+                        let rxg   = *shared.uhd_rx_gain_db.lock().unwrap();
+                        let txg   = *shared.uhd_tx_gain_db.lock().unwrap();
+                        let sr_hz = *shared.samp_rate_khz.lock().unwrap() as f64 * 1000.0;
+                        let bw_hz = sr_hz / *shared.os_factor.lock().unwrap() as f64;
+
+                        let reuse = parked_uhd.as_ref()
+                            .map(|(_, args)| args == &cur_args)
+                            .unwrap_or(false);
+
+                        if reuse {
+                            let (mut dev, _) = parked_uhd.take().unwrap();
+                            dev.unpark(freq, sr_hz, bw_hz, rxg, txg);
+                            driver = dev;
+                        } else {
+                            parked_uhd = None; // drop stale cached device
+                            driver = Box::new(Channel::new(0.0, 1.0)); // close current first
+                            match UhdDevice::new(&cur_args, freq, sr_hz, bw_hz, rxg, txg) {
+                                Ok(dev) => driver = Box::new(dev),
+                                Err(e)  => {
+                                    eprintln!("[uhd] open failed: {e} — falling back to sim");
+                                    shared.use_uhd.store(false, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        last_uhd_rx_gain = f64::NAN;
+                        last_uhd_tx_gain = f64::NAN;
+                    } else {
+                        // ── Park UHD or switch to sim ────────────────────────
+                        if driver.is_parkable() {
+                            let noise = db_to_amp(*shared.noise_db.lock().unwrap()) / std::f32::consts::SQRT_2;
+                            let sig   = db_to_amp(*shared.signal_db.lock().unwrap());
+                            let mut old = std::mem::replace(&mut driver, Box::new(Channel::new(noise, sig)));
+                            old.park();
+                            parked_uhd = Some((old, cur_args));
+                        } else {
+                            driver = make_driver(&shared);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "uhd"))]
+                {
+                    driver = Box::new(Channel::new(0.0, 1.0));
+                    driver = make_driver(&shared);
+                }
             } else {
                 driver.clear();
             }

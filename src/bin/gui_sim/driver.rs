@@ -30,4 +30,14 @@ pub(crate) trait Driver: Send {
 
     /// Apply hardware TX gain in dB.  No-op for the sim channel.
     fn set_hw_tx_gain(&mut self, _db: f64) {}
+
+    /// Whether this driver supports park/unpark without full teardown.
+    fn is_parkable(&self) -> bool { false }
+
+    /// Stop hardware streaming and idle worker threads.  No-op for sim.
+    fn park(&mut self) {}
+
+    /// Restart hardware streaming, re-applying the given RF settings.  No-op for sim.
+    fn unpark(&mut self, _freq_hz: f64, _sr_hz: f64, _bw_hz: f64,
+              _rx_gain_db: f64, _tx_gain_db: f64) {}
 }

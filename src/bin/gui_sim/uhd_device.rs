@@ -51,6 +51,8 @@ pub(crate) struct UhdDevice {
     signal_amp: Arc<Mutex<f32>>,
     /// Signals worker threads to exit.
     running:    Arc<AtomicBool>,
+    /// When false the RX thread idles without calling uhd_glue_recv (parked).
+    streaming:  Arc<AtomicBool>,
     /// Worker thread handles — joined in Drop before closing UHD handles.
     tx_thread:  Option<JoinHandle<()>>,
     rx_thread:  Option<JoinHandle<()>>,
@@ -96,6 +98,7 @@ impl UhdDevice {
         let rx_buffer  = Arc::new(Mutex::new(VecDeque::<Complex<f32>>::new()));
         let signal_amp = Arc::new(Mutex::new(1.0f32));
         let running    = Arc::new(AtomicBool::new(true));
+        let streaming  = Arc::new(AtomicBool::new(true));
 
         // ── TX worker ─────────────────────────────────────────────────────────
         // Drains the tx_queue in chunks of tx_buf_size; pads with zeros when
@@ -121,14 +124,20 @@ impl UhdDevice {
 
         // ── RX worker ─────────────────────────────────────────────────────────
         // Calls uhd_glue_recv in a loop (0.1 s timeout); converts sc16 →
-        // Complex<f32> and appends to rx_buffer.
+        // Complex<f32> and appends to rx_buffer.  Idles when `streaming` is
+        // false so the device can be parked without stopping the thread.
         let rx_thread = {
-            let rx_buf = rx_buffer.clone();
-            let run    = running.clone();
+            let rx_buf   = rx_buffer.clone();
+            let run      = running.clone();
+            let stream   = streaming.clone();
             std::thread::spawn(move || {
                 let buf_size = rx_buf_size.max(1024);
                 let mut buf  = vec![0i16; buf_size * 2];
                 while run.load(Ordering::Relaxed) {
+                    if !stream.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
                     let n = unsafe { ffi::uhd_glue_recv(buf.as_mut_ptr(), buf_size) };
                     if n > 0 {
                         let samples: Vec<Complex<f32>> = buf[..n * 2]
@@ -141,7 +150,7 @@ impl UhdDevice {
             })
         };
 
-        Ok(Self { tx_queue, rx_buffer, signal_amp, running,
+        Ok(Self { tx_queue, rx_buffer, signal_amp, running, streaming,
                   tx_thread: Some(tx_thread), rx_thread: Some(rx_thread) })
     }
 }
@@ -212,5 +221,26 @@ impl Driver for UhdDevice {
 
     fn set_hw_tx_gain(&mut self, db: f64) {
         unsafe { ffi::uhd_glue_set_tx_gain(db); }
+    }
+
+    fn is_parkable(&self) -> bool { true }
+
+    fn park(&mut self) {
+        unsafe { ffi::uhd_glue_stop_rx(); }
+        self.streaming.store(false, Ordering::Relaxed);
+        self.rx_buffer.lock().unwrap().clear();
+    }
+
+    fn unpark(&mut self, freq_hz: f64, sr_hz: f64, bw_hz: f64,
+              rx_gain_db: f64, tx_gain_db: f64) {
+        unsafe {
+            ffi::uhd_glue_set_rx_rate(sr_hz);   ffi::uhd_glue_set_rx_bw(bw_hz);
+            ffi::uhd_glue_set_rx_freq(freq_hz); ffi::uhd_glue_set_rx_gain(rx_gain_db);
+            ffi::uhd_glue_set_tx_rate(sr_hz);   ffi::uhd_glue_set_tx_bw(bw_hz);
+            ffi::uhd_glue_set_tx_freq(freq_hz); ffi::uhd_glue_set_tx_gain(tx_gain_db);
+            ffi::uhd_glue_start_rx();
+        }
+        self.streaming.store(true, Ordering::Relaxed);
+        self.rx_buffer.lock().unwrap().clear();
     }
 }
