@@ -2,8 +2,15 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::f64::consts::TAU;
 
 pub struct FrameSyncResult {
-    pub found:   bool,
-    pub symbols: Vec<Complex<f32>>,
+    pub found:    bool,
+    pub symbols:  Vec<Complex<f32>>,
+    /// Number of input samples consumed. Safe to drain from a streaming buffer.
+    ///
+    /// When `found == true`: covers everything through the end of the extracted
+    /// payload symbols.  When `found == false`: covers all samples that were
+    /// scanned without finding a complete preamble (any partial preamble at the
+    /// tail is *kept*).
+    pub consumed: usize,
 }
 
 fn make_downchirp(sf: u8) -> Vec<Complex<f32>> {
@@ -76,11 +83,13 @@ pub fn frame_sync(
                 if payload_start + sps <= samples.len() {
                     let len = ((samples.len() - payload_start) / sps) * sps;
                     return FrameSyncResult {
-                        found:   true,
-                        symbols: samples[payload_start..payload_start + len].to_vec(),
+                        found:    true,
+                        symbols:  samples[payload_start..payload_start + len].to_vec(),
+                        consumed: payload_start + len,
                     };
                 }
-                break;
+                // Preamble found but not enough payload yet — keep it.
+                return FrameSyncResult { found: false, symbols: vec![], consumed: preamble_start };
             }
         } else {
             consec = 0;
@@ -88,5 +97,7 @@ pub fn frame_sync(
         w += sps;
     }
 
-    FrameSyncResult { found: false, symbols: vec![] }
+    // Partial preamble at the tail → keep from preamble_start onward.
+    let consumed = if consec > 0 { preamble_start } else { w };
+    FrameSyncResult { found: false, symbols: vec![], consumed }
 }

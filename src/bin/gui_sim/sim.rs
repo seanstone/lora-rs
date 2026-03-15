@@ -23,7 +23,8 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         b"Hello, LoRa!", b"Rust 2024", b"AWGN channel",
         b"burst test",   b"lora-rs",   b"packet!",
     ];
-    let mut idx = 0usize;
+    let mut payload_idx = 0usize;
+    let mut seq         = 0u16;
 
     // Virtual sample clock.
     let mut produced_samples: u64 = 0;
@@ -33,8 +34,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     let mut tx_inflight = false;
     // Completed TxResult waiting to be pushed to the channel at the right time.
     let mut tx_buffered: Option<TxResult> = None;
-    // true while the channel has a packet queued or in progress.
-    let mut tx_in_channel = false;
 
     // Spawn worker threads.
     let (rx_send,     rx_recv)     = std::sync::mpsc::channel::<RxJob>();
@@ -59,11 +58,15 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         db_to_amp(init_signal_db),
     );
 
-    // Dispatch the next TX modulation job to the worker thread.
+    // Build a numbered payload: [seq_le16][text].
     macro_rules! dispatch_tx {
         ($sf:expr, $os:expr) => {{
-            let payload = payloads[idx % payloads.len()].to_vec();
-            idx += 1;
+            let text = payloads[payload_idx % payloads.len()];
+            payload_idx += 1;
+            let mut payload = Vec::with_capacity(2 + text.len());
+            payload.extend_from_slice(&seq.to_le_bytes());
+            payload.extend_from_slice(text);
+            seq = seq.wrapping_add(1);
             let _ = tx_job_send.send(TxJob { sf: $sf, cr: 4, os_factor: $os, payload });
             tx_inflight = true;
         }};
@@ -81,7 +84,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         if shared.clear_buf.swap(false, Ordering::Relaxed) {
             channel.clear();
             tx_buffered      = None;
-            tx_in_channel    = false;
             produced_samples = 0;
             next_packet_at   = 0;
             last_interval_ms = u64::MAX;
@@ -125,29 +127,33 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             }
         }
 
-        // Push the buffered packet into the channel when the interval has elapsed.
-        if !tx_in_channel && next_packet_at <= produced_samples {
+        // Push samples into the channel when the interval has elapsed.
+        if next_packet_at <= produced_samples {
             if let Some(res) = tx_buffered.take() {
-                channel.push_packet(res.payload, res.clean);
-                tx_in_channel = true;
+                let pkt_seq  = u16::from_le_bytes([res.payload[0], res.payload[1]]);
+                let pkt_text = String::from_utf8_lossy(&res.payload[2..]).to_string();
+                {
+                    let mut s = shared.stats.lock().unwrap();
+                    s.tx_count += 1;
+                    s.last_tx = format!("#{pkt_seq} {pkt_text}");
+                }
+                channel.push_samples(res.clean);
+                next_packet_at = produced_samples + interval_samples;
             }
-            // If tx_buffered was empty the worker is still modulating; the
-            // channel streams silence until the packet arrives next tick.
         }
 
         // ── Channel tick: produce one tick's worth of mixed samples ───────
-        let n = samples_per_tick as usize;
-        let (mixed, completed) = channel.tick(n);
+        let n     = samples_per_tick as usize;
+        let mixed = channel.tick(n);
         produced_samples += n as u64;
 
-        // Completed packets → RX decoder; schedule next packet.
-        for (payload, mixed_pkt) in completed {
-            tx_in_channel  = false;
-            next_packet_at = produced_samples + interval_samples;
-            let _ = rx_send.send(RxJob { sf, cr: 4, os_factor, payload, mixed: mixed_pkt });
-        }
+        // ── Mixed samples → RX worker (continuous stream) ────────────────
+        let _ = rx_send.send(RxJob {
+            sf, cr: 4, os_factor,
+            samples: mixed.clone(),
+        });
 
-        // ── Channel → display thread ──────────────────────────────────────
+        // ── Mixed samples → display thread ───────────────────────────────
         let target_rows = (n / fft_size).max(1).min(MAX_ROWS_PER_TICK);
         let avail_rows  = mixed.len() / fft_size;
         let rows        = target_rows.min(avail_rows);
@@ -158,8 +164,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                 let _ = ds.send((window, i + 1 == rows));
             }
         }
-        // In headless mode mixed samples are simply discarded; Channel::tick()
-        // already produced them internally.
 
         // ── Buffer status ─────────────────────────────────────────────────
         let pending   = channel.pending_samples();

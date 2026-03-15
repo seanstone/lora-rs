@@ -4,12 +4,18 @@
 /// ─────────────────────────────────
 ///   shared   — SimShared, Stats, LogEntry
 ///   tx       — Tx modulator, TxJob/TxResult, tx_worker
-///   channel  — Channel: per-sample AWGN mixer
-///   rx       — Rx demodulator, RxJob, rx_worker
+///   channel  — Channel: pure streaming per-sample AWGN mixer (no packet tracking)
+///   rx       — Rx demodulator, streaming RxJob worker with frame-sync buffer drain
 ///   display  — spectrum_window, display_worker
-///   sim      — sim_loop (drives TX→Channel→RX pipeline)
+///   sim      — sim_loop (drives TX→Channel→RX streaming pipeline)
 ///   gui      — GuiApp (eframe/egui)
 ///   headless — run_headless (CLI / CI mode)
+///
+/// Data flow: TX numbers packets in the payload ([seq_u16_le][text]), modulates
+/// clean IQ, and pushes raw samples into the channel.  The channel adds AWGN
+/// and streams mixed samples out — it has no concept of packet boundaries.
+/// The RX worker accumulates mixed samples, runs frame_sync to discover packets,
+/// decodes them, and detects lost packets via sequence gaps.
 ///
 /// Usage:
 ///   gui_sim [sf]                  — GUI mode

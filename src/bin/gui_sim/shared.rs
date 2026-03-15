@@ -26,10 +26,11 @@ pub(crate) struct SimShared {
 
 #[derive(Default, Clone)]
 pub(crate) struct Stats {
-    pub total:   usize,
-    pub ok:      usize,
-    pub last_tx: String,
-    pub last_rx: String,
+    pub tx_count: usize,
+    pub rx_count: usize,
+    pub rx_lost:  usize,
+    pub last_tx:  String,
+    pub last_rx:  String,
 }
 
 #[derive(Clone)]

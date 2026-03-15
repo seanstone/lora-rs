@@ -295,11 +295,18 @@ impl eframe::App for GuiApp {
                 ui.separator();
 
                 // ── Stats + reset ─────────────────────────────────────────────
-                let per = if stats.total > 0 {
-                    100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
+                let accounted = stats.rx_count + stats.rx_lost;
+                let per = if accounted > 0 {
+                    100.0 * stats.rx_lost as f32 / accounted as f32
                 } else { 0.0 };
                 ui.horizontal(|ui| {
-                    ui.label(format!("{}/{} ok", stats.ok, stats.total));
+                    ui.label(format!("{}/{} rx", stats.rx_count, stats.tx_count));
+                    if stats.rx_lost > 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 60, 60),
+                            format!("{} lost", stats.rx_lost),
+                        );
+                    }
                     ui.label(format!("PER {:.0}%", per));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("↺ Reset").clicked() {

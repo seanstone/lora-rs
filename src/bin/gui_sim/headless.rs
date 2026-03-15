@@ -13,7 +13,7 @@ use super::{DEFAULT_SIGNAL_DB, DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FF
 /// Run the simulator headlessly and print per-packet results to stdout.
 ///
 /// Useful for automated tests and CI: exits once `packet_count` packets have
-/// been decoded (success or failure).
+/// been accounted for on the RX side (decoded + lost).
 pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
     let signal_db = DEFAULT_SIGNAL_DB;
     let noise_db  = signal_db - snr_db_val;
@@ -56,13 +56,22 @@ pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
         printed = log.len();
 
         let stats = shared.stats.lock().unwrap().clone();
-        if stats.total >= packet_count {
+        if stats.tx_count >= packet_count {
+            // Give the RX pipeline time to drain remaining packets.
+            std::thread::sleep(Duration::from_secs(1));
+            let log = shared.log.lock().unwrap().clone();
+            for entry in log.iter().skip(printed) {
+                let mark = if entry.ok { "OK  " } else { "FAIL" };
+                println!("[{mark}] {}", entry.payload);
+            }
+            let stats = shared.stats.lock().unwrap().clone();
             shared.running.store(false, Ordering::Relaxed);
-            let per = if stats.total > 0 {
-                100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
+            let accounted = stats.rx_count + stats.rx_lost;
+            let per = if accounted > 0 {
+                100.0 * stats.rx_lost as f32 / accounted as f32
             } else { 0.0 };
-            println!("─── SF={sf}  SNR={snr_db_val:.1} dB  {}/{} ok  PER {per:.1}% ───",
-                     stats.ok, stats.total);
+            println!("─── SF={sf}  SNR={snr_db_val:.1} dB  {}/{} rx  {} lost  PER {per:.1}% ───",
+                     stats.rx_count, stats.tx_count, stats.rx_lost);
             break;
         }
     }
