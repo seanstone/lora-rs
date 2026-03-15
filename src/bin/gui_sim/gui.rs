@@ -22,6 +22,9 @@ pub(crate) struct GuiApp {
     thread_started:  bool,
     /// Shared with `main()` so the join can happen after the window closes.
     sim_thread:      Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Last known X bounds — used to detect which chart panned/zoomed so we
+    /// can copy the new range to the other chart next frame.
+    last_synced_x:   [f64; 2],
     signal_db:       f32,
     noise_db:        f32,
     interval_ms:     u64,
@@ -105,6 +108,7 @@ impl GuiApp {
             waterfall_chart,
             thread_started: false,
             sim_thread,
+            last_synced_x:  [0.0, fft_size as f64],
             signal_db,
             noise_db,
             interval_ms: DEFAULT_INTERVAL_MS,
@@ -458,6 +462,18 @@ impl eframe::App for GuiApp {
             ui.allocate_ui(Vec2::new(w, h * 0.40), |ui| self.spectrum_chart.ui(ui));
             ui.allocate_ui(Vec2::new(w, h * 0.60), |ui| self.waterfall_chart.ui(ui));
         });
+
+        // Cross-sync X bounds: whichever chart changed since last frame
+        // propagates its new range to the other one next frame.
+        let sx = self.spectrum_chart.last_x_bounds();
+        let wx = self.waterfall_chart.last_x_bounds();
+        if sx != self.last_synced_x {
+            self.waterfall_chart.sync_x_bounds(sx);
+            self.last_synced_x = sx;
+        } else if wx != self.last_synced_x {
+            self.spectrum_chart.sync_x_bounds(wx);
+            self.last_synced_x = wx;
+        }
 
         // Repaint is driven by the sim thread via ctx.request_repaint().
     }

@@ -53,6 +53,13 @@ impl Chart {
         self.last_y_bounds = limits;
     }
 
+    /// X bounds as of the last rendered frame (already clamped by limit_bounds).
+    pub fn last_x_bounds(&self) -> [f64; 2] { self.last_x_bounds }
+
+    /// Override the X bounds for the next frame (bypasses limit_bounds, but
+    /// the value should already be clamped by the source chart).
+    pub fn sync_x_bounds(&mut self, bounds: [f64; 2]) { self.x_bounds = Some(bounds); }
+
     pub fn set_link_axis(&mut self, id: &str, x: bool, y: bool) {
         self.link_axis = (id.to_string().into(), Vec2b::new(x, y));
     }
