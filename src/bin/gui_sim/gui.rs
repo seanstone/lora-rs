@@ -27,6 +27,11 @@ pub(crate) struct GuiApp {
     samp_rate_khz:   u32,
     bw_khz:          u32,
     fft_size:        usize,
+    // ── UHD hardware device UI state ──────────────────────────────────────────
+    uhd_args:        String,
+    uhd_freq_mhz:    f64,
+    uhd_rx_gain_db:  f64,
+    uhd_tx_gain_db:  f64,
 }
 
 impl GuiApp {
@@ -79,6 +84,12 @@ impl GuiApp {
             buf_overflow:   AtomicBool::new(false),
             buf_underflow:  AtomicBool::new(false),
             tx_starved:     AtomicBool::new(false),
+            use_uhd:        AtomicBool::new(false),
+            uhd_args:       Mutex::new(String::new()),
+            uhd_freq_hz:    Mutex::new(915e6),
+            uhd_rx_gain_db: Mutex::new(30.0),
+            uhd_tx_gain_db: Mutex::new(30.0),
+            rebuild_driver: AtomicBool::new(false),
         });
 
         Self {
@@ -93,6 +104,10 @@ impl GuiApp {
             samp_rate_khz,
             bw_khz,
             fft_size,
+            uhd_args:       String::new(),
+            uhd_freq_mhz:   915.0,
+            uhd_rx_gain_db: 30.0,
+            uhd_tx_gain_db: 30.0,
         }
     }
 
@@ -295,6 +310,70 @@ impl eframe::App for GuiApp {
                     ).on_hover_text("TX modulator can't keep up with the requested interval — gaps in the IQ stream");
                 }
             });
+            // ── Row 4: UHD hardware device (feature-gated) ───────────────────
+            #[cfg(feature = "uhd")]
+            {
+                use std::sync::atomic::Ordering;
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    let use_uhd = self.shared.use_uhd.load(Ordering::Relaxed);
+                    if ui.selectable_label(!use_uhd, "Sim").clicked() && use_uhd {
+                        self.shared.use_uhd.store(false, Ordering::Relaxed);
+                        self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                    }
+                    if ui.selectable_label(use_uhd, "UHD").clicked() && !use_uhd {
+                        self.shared.use_uhd.store(true, Ordering::Relaxed);
+                        self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                    }
+
+                    ui.separator();
+
+                    let h = ui.spacing().interact_size.y;
+                    let mut uhd_changed = false;
+
+                    ui.label("Args:");
+                    if ui.add_sized([120.0, h], egui::TextEdit::singleline(&mut self.uhd_args)
+                        .hint_text("addr=… or empty")).lost_focus()
+                    {
+                        uhd_changed = true;
+                    }
+
+                    ui.separator();
+
+                    ui.label("Freq:");
+                    if ui.add_sized([100.0, h], egui::DragValue::new(&mut self.uhd_freq_mhz)
+                        .speed(0.1).suffix(" MHz").range(1.0..=6000.0)).changed()
+                    {
+                        uhd_changed = true;
+                    }
+
+                    ui.separator();
+
+                    ui.label("RX gain:");
+                    if ui.add_sized([80.0, h], egui::DragValue::new(&mut self.uhd_rx_gain_db)
+                        .speed(0.5).suffix(" dB").range(0.0..=76.0)).changed()
+                    {
+                        uhd_changed = true;
+                    }
+
+                    ui.label("TX gain:");
+                    if ui.add_sized([80.0, h], egui::DragValue::new(&mut self.uhd_tx_gain_db)
+                        .speed(0.5).suffix(" dB").range(0.0..=89.0)).changed()
+                    {
+                        uhd_changed = true;
+                    }
+
+                    if uhd_changed {
+                        *self.shared.uhd_args.lock().unwrap()       = self.uhd_args.clone();
+                        *self.shared.uhd_freq_hz.lock().unwrap()    = self.uhd_freq_mhz * 1e6;
+                        *self.shared.uhd_rx_gain_db.lock().unwrap() = self.uhd_rx_gain_db;
+                        *self.shared.uhd_tx_gain_db.lock().unwrap() = self.uhd_tx_gain_db;
+                        if self.shared.use_uhd.load(Ordering::Relaxed) {
+                            self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
         });
 
         egui::SidePanel::right("msg_log")

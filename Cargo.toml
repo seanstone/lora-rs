@@ -3,6 +3,12 @@ name = "lora"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+uhd = []
+
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 rustfft  = "6.4.1"
 rand     = { version = "0.10.0", features = ["std_rng"] }

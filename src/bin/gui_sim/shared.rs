@@ -25,6 +25,20 @@ pub(crate) struct SimShared {
     /// True when the TX scheduler wants to push a packet but the modulator
     /// hasn't finished yet — TX can't fill the requested interval rate.
     pub tx_starved:     AtomicBool,
+
+    // ── UHD hardware device settings ──────────────────────────────────────────
+    /// Use a real USRP instead of the simulated AWGN channel.
+    pub use_uhd:         AtomicBool,
+    /// UHD device args string (e.g. "" for auto, "addr=192.168.10.2", …).
+    pub uhd_args:        Mutex<String>,
+    /// Center frequency in Hz.
+    pub uhd_freq_hz:     Mutex<f64>,
+    /// RX gain in dB.
+    pub uhd_rx_gain_db:  Mutex<f64>,
+    /// TX gain in dB.
+    pub uhd_tx_gain_db:  Mutex<f64>,
+    /// Set to true to ask the sim loop to tear down and re-open the UHD device.
+    pub rebuild_driver:  AtomicBool,
 }
 
 #[derive(Default, Clone)]

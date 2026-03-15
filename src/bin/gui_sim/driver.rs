@@ -1,0 +1,27 @@
+use rustfft::num_complex::Complex;
+
+/// Abstraction over the IQ transport layer (sim channel or UHD hardware).
+///
+/// The sim loop calls:
+///   - `push_samples` to hand off clean TX samples.
+///   - `tick(n)` to consume n samples from the receive path (blocks on hardware).
+///   - `pending_samples` for throttle / lag display.
+///   - `clear` on reset / settings change.
+///   - `set_signal_amp` / `set_noise_sigma` for level control.
+pub(crate) trait Driver: Send {
+    fn push_samples(&mut self, samples: Vec<Complex<f32>>);
+
+    /// Produce exactly `n` received samples.  May block (hardware) or be instant (sim).
+    fn tick(&mut self, n: usize) -> Vec<Complex<f32>>;
+
+    /// Approximate number of TX samples still queued / in-flight.
+    fn pending_samples(&self) -> usize;
+
+    /// Flush all in-flight state (called on reset / settings change).
+    fn clear(&mut self);
+
+    fn set_signal_amp(&mut self, amp: f32);
+
+    /// No-op for hardware drivers (noise comes from the RF environment).
+    fn set_noise_sigma(&mut self, sigma: f32);
+}

@@ -7,10 +7,39 @@ use std::{
 
 use super::channel::Channel;
 use super::display::{DisplayJob, display_worker};
+use super::driver::Driver;
 use super::rx::{RxJob, rx_worker};
 use super::shared::SimShared;
 use super::tx::{TxJob, TxResult, tx_worker};
 use super::db_to_amp;
+
+#[cfg(feature = "uhd")]
+use super::uhd_device::UhdDevice;
+
+fn make_driver(shared: &SimShared) -> Box<dyn Driver> {
+    let noise_sigma = db_to_amp(*shared.noise_db.lock().unwrap()) / std::f32::consts::SQRT_2;
+    let signal_amp  = db_to_amp(*shared.signal_db.lock().unwrap());
+
+    #[cfg(feature = "uhd")]
+    if shared.use_uhd.load(Ordering::Relaxed) {
+        let args       = shared.uhd_args.lock().unwrap().clone();
+        let freq       = *shared.uhd_freq_hz.lock().unwrap();
+        let rx_gain    = *shared.uhd_rx_gain_db.lock().unwrap();
+        let tx_gain    = *shared.uhd_tx_gain_db.lock().unwrap();
+        let sr_hz      = *shared.samp_rate_khz.lock().unwrap() as f64 * 1000.0;
+        let os         = *shared.os_factor.lock().unwrap() as f64;
+        let bw_hz      = sr_hz / os;
+        match UhdDevice::new(&args, freq, sr_hz, bw_hz, rx_gain, tx_gain) {
+            Ok(dev) => return Box::new(dev),
+            Err(e)  => {
+                eprintln!("[uhd] open failed: {e} — falling back to sim");
+                shared.use_uhd.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    Box::new(Channel::new(noise_sigma, signal_amp))
+}
 
 /// Tick interval for the stream thread (~60 fps waterfall scroll).
 pub(crate) const TICK: Duration = Duration::from_millis(16);
@@ -58,12 +87,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         None
     };
 
-    let init_signal_db = *shared.signal_db.lock().unwrap();
-    let init_noise_db  = *shared.noise_db.lock().unwrap();
-    let mut channel = Channel::new(
-        db_to_amp(init_noise_db)  / std::f32::consts::SQRT_2,
-        db_to_amp(init_signal_db),
-    );
+    let mut driver: Box<dyn Driver> = make_driver(&shared);
 
     // Build a numbered payload: [seq_le16][text].
     macro_rules! dispatch_tx {
@@ -87,9 +111,15 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             continue;
         }
 
-        // Flush channel on settings change; reset virtual clock.
-        if shared.clear_buf.swap(false, Ordering::Relaxed) {
-            channel.clear();
+        // Rebuild driver on UHD settings change; flush on any settings change.
+        let should_rebuild = shared.rebuild_driver.swap(false, Ordering::Relaxed);
+        let should_clear   = shared.clear_buf.swap(false, Ordering::Relaxed);
+        if should_rebuild || should_clear {
+            if should_rebuild {
+                driver = make_driver(&shared);
+            } else {
+                driver.clear();
+            }
             tx_queue.clear();
             while tx_res_recv.try_recv().is_ok() {}
             jobs_in_flight   = 0;
@@ -112,9 +142,9 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         let signal_amp  = db_to_amp(signal_db);
         let noise_sigma = db_to_amp(noise_db) / std::f32::consts::SQRT_2;
 
-        // Push current levels into the channel — applied per-sample in tick().
-        channel.set_noise_sigma(noise_sigma);
-        channel.set_signal_amp(signal_amp);
+        // Push current levels into the driver — applied per-sample in tick().
+        driver.set_noise_sigma(noise_sigma);
+        driver.set_signal_amp(signal_amp);
 
         let samp_rate_hz     = samp_rate_khz as u64 * 1000;
         let samples_per_tick = (samp_rate_hz as f64 * TICK.as_secs_f64()).round() as u64;
@@ -135,18 +165,18 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             // Stale result from before a reset — silently discard.
         }
 
-        // ── Push packets into the channel ─────────────────────────────────
-        // Hard cap: never let the channel buffer grow beyond 4 ticks of samples
+        // ── Push packets into the driver ──────────────────────────────────
+        // Hard cap: never let the driver buffer grow beyond 4 ticks of samples
         // (prevents tx_count racing ahead of rx_count at interval=0).
         let max_pending      = samples_per_tick as usize * 4;
         // Fill target for interval=0: keep at least one full tick pre-buffered
-        // so the channel never runs dry mid-tick (which would create silence gaps).
+        // so the driver never runs dry mid-tick (which would create silence gaps).
         let fill_target      = samples_per_tick as usize;
 
         let mut starved = false;
         if next_packet_at <= produced_samples {
             loop {
-                if channel.pending_samples() >= max_pending { break; }
+                if driver.pending_samples() >= max_pending { break; }
                 match tx_queue.pop_front() {
                     Some(res) => {
                         let pkt_seq  = u16::from_le_bytes([res.payload[0], res.payload[1]]);
@@ -156,13 +186,13 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                             s.tx_count += 1;
                             s.last_tx   = format!("#{pkt_seq} {pkt_text}");
                         }
-                        channel.push_samples(res.clean);
+                        driver.push_samples(res.clean);
                         next_packet_at = produced_samples + interval_samples;
 
                         // For non-zero intervals: one push per interval tick.
                         // For interval=0: keep looping until the fill target is met.
                         if interval_samples > 0 { break; }
-                        if channel.pending_samples() >= fill_target { break; }
+                        if driver.pending_samples() >= fill_target { break; }
                     }
                     None => { starved = true; break; }
                 }
@@ -177,9 +207,9 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             dispatch_tx!(sf, os_factor);
         }
 
-        // ── Channel tick: produce one tick's worth of mixed samples ───────
+        // ── Driver tick: produce one tick's worth of mixed samples ────────
         let n     = samples_per_tick as usize;
-        let mixed = channel.tick(n);
+        let mixed = driver.tick(n);
         produced_samples += n as u64;
 
         // ── Mixed samples → RX worker (continuous stream) ────────────────
@@ -202,7 +232,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         }
 
         // ── Buffer status ─────────────────────────────────────────────────
-        let pending   = channel.pending_samples();
+        let pending   = driver.pending_samples();
         let lag_ms    = pending as f32 * 1000.0 / samp_rate_hz as f32;
         let overflow  = avail_rows > target_rows * 8;
         let underflow = avail_rows == 0;

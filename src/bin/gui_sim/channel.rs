@@ -2,6 +2,8 @@ use rand::{Rng, RngExt, SeedableRng};
 use rustfft::num_complex::Complex;
 use std::collections::VecDeque;
 
+use super::driver::Driver;
+
 // ─── Channel ──────────────────────────────────────────────────────────────────
 //
 // Pure streaming per-sample AWGN mixer. The channel has no concept of packet
@@ -66,6 +68,15 @@ impl Channel {
         }
         out
     }
+}
+
+impl Driver for Channel {
+    fn push_samples(&mut self, samples: Vec<Complex<f32>>) { self.push_samples(samples); }
+    fn tick(&mut self, n: usize) -> Vec<Complex<f32>>      { self.tick(n) }
+    fn pending_samples(&self) -> usize                     { self.pending_samples() }
+    fn clear(&mut self)                                    { self.clear(); }
+    fn set_signal_amp(&mut self, amp: f32)                 { self.set_signal_amp(amp); }
+    fn set_noise_sigma(&mut self, sigma: f32)              { self.set_noise_sigma(sigma); }
 }
 
 /// Box-Muller: one unit-normal sample from two uniform draws.
