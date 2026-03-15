@@ -24,4 +24,10 @@ pub(crate) trait Driver: Send {
 
     /// No-op for hardware drivers (noise comes from the RF environment).
     fn set_noise_sigma(&mut self, sigma: f32);
+
+    /// Apply hardware RX gain in dB.  No-op for the sim channel.
+    fn set_hw_rx_gain(&mut self, _db: f64) {}
+
+    /// Apply hardware TX gain in dB.  No-op for the sim channel.
+    fn set_hw_tx_gain(&mut self, _db: f64) {}
 }

@@ -198,4 +198,12 @@ impl Driver for UhdDevice {
 
     /// No-op for hardware — noise comes from the RF environment.
     fn set_noise_sigma(&mut self, _sigma: f32) {}
+
+    fn set_hw_rx_gain(&mut self, db: f64) {
+        unsafe { ffi::uhd_glue_set_rx_gain(db); }
+    }
+
+    fn set_hw_tx_gain(&mut self, db: f64) {
+        unsafe { ffi::uhd_glue_set_tx_gain(db); }
+    }
 }

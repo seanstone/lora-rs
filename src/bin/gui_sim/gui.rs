@@ -320,7 +320,6 @@ impl eframe::App for GuiApp {
                             .suffix(" dB").step_by(0.5)).changed()
                         {
                             *self.shared.uhd_tx_gain_db.lock().unwrap() = self.uhd_tx_gain_db;
-                            self.shared.rebuild_driver.store(true, Ordering::Relaxed);
                         }
                     }
                 });
@@ -345,7 +344,6 @@ impl eframe::App for GuiApp {
                                 .suffix(" dB").step_by(0.5)).changed()
                             {
                                 *self.shared.uhd_rx_gain_db.lock().unwrap() = self.uhd_rx_gain_db;
-                                self.shared.rebuild_driver.store(true, Ordering::Relaxed);
                             }
                         }
                     }

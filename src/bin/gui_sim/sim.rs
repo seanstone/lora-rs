@@ -66,6 +66,9 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     let mut produced_samples: u64 = 0;
     let mut next_packet_at:   u64 = 0;
     let mut last_interval_ms: u64 = u64::MAX;
+    // Track UHD gain values so we only call into hardware on change.
+    let mut last_uhd_rx_gain = f64::NAN;
+    let mut last_uhd_tx_gain = f64::NAN;
     // Pre-modulated packets ready to push into the channel.
     let mut tx_queue: VecDeque<TxResult> = VecDeque::new();
     // Jobs sent to the TX worker that haven't produced a result yet.
@@ -148,6 +151,12 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         // Push current levels into the driver — applied per-sample in tick().
         driver.set_noise_sigma(noise_sigma);
         driver.set_signal_amp(signal_amp);
+
+        // Apply hardware gains on change (no-op for sim channel).
+        let uhd_rx_gain = *shared.uhd_rx_gain_db.lock().unwrap();
+        let uhd_tx_gain = *shared.uhd_tx_gain_db.lock().unwrap();
+        if uhd_rx_gain != last_uhd_rx_gain { last_uhd_rx_gain = uhd_rx_gain; driver.set_hw_rx_gain(uhd_rx_gain); }
+        if uhd_tx_gain != last_uhd_tx_gain { last_uhd_tx_gain = uhd_tx_gain; driver.set_hw_tx_gain(uhd_tx_gain); }
 
         let samp_rate_hz     = samp_rate_khz as u64 * 1000;
         let samples_per_tick = (samp_rate_hz as f64 * TICK.as_secs_f64()).round() as u64;
