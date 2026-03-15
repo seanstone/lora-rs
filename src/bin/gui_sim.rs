@@ -84,6 +84,14 @@ fn main() {
 
     let sf = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SF);
     use eframe::egui;
+    use std::sync::{Arc, Mutex};
+
+    // Shared between GuiApp and main so the join happens *after* the window
+    // is gone (run_native returned) rather than inside on_exit — prevents freeze.
+    let sim_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(None));
+    let sim_thread_for_app = sim_thread.clone();
+
     eframe::run_native(
         "LoRa Link Simulator",
         eframe::NativeOptions {
@@ -92,6 +100,14 @@ fn main() {
                 .with_inner_size([1400.0, 750.0]),
             ..Default::default()
         },
-        Box::new(move |_cc| Ok(Box::new(gui::GuiApp::new(sf)))),
+        Box::new(move |_cc| Ok(Box::new(gui::GuiApp::new(sf, sim_thread_for_app)))),
     ).unwrap();
+
+    // Window is now closed.  Wait for the sim thread (and UHD TX/RX workers)
+    // to finish, then hard-exit so we don't wait for the background
+    // uhd_glue_close() thread (uhd_usrp_free can take several seconds).
+    if let Some(h) = sim_thread.lock().unwrap().take() {
+        let _ = h.join();
+    }
+    std::process::exit(0);
 }

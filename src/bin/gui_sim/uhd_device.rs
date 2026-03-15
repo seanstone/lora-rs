@@ -165,7 +165,11 @@ impl Drop for UhdDevice {
         // otherwise they may call uhd_glue_send/recv on freed pointers.
         if let Some(h) = self.tx_thread.take() { let _ = h.join(); }
         if let Some(h) = self.rx_thread.take() { let _ = h.join(); }
-        unsafe { ffi::uhd_glue_close(); }
+        // uhd_glue_close() (uhd_usrp_free) can block for several seconds
+        // while the USRP resets its firmware.  Detach it so Drop returns
+        // immediately; process::exit(0) in main ensures the process doesn't
+        // wait for it either.
+        std::thread::spawn(|| unsafe { ffi::uhd_glue_close(); });
     }
 }
 

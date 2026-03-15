@@ -20,6 +20,8 @@ pub(crate) struct GuiApp {
     spectrum_chart:  Chart,
     waterfall_chart: Chart,
     thread_started:  bool,
+    /// Shared with `main()` so the join can happen after the window closes.
+    sim_thread:      Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     signal_db:       f32,
     noise_db:        f32,
     interval_ms:     u64,
@@ -35,7 +37,10 @@ pub(crate) struct GuiApp {
 }
 
 impl GuiApp {
-    pub fn new(sf: u8) -> Self {
+    pub fn new(
+        sf: u8,
+        sim_thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    ) -> Self {
         let samp_rate_khz  = DEFAULT_SAMP_RATE_KHZ;
         let bw_khz         = DEFAULT_BW_KHZ;
         let (_, os_factor) = effective_sr_and_os(samp_rate_khz, bw_khz);
@@ -91,6 +96,7 @@ impl GuiApp {
             uhd_tx_gain_db: Mutex::new(40.0),
             rebuild_driver: AtomicBool::new(false),
             uhd_loading:    AtomicBool::new(false),
+            quit:           AtomicBool::new(false),
         });
 
         Self {
@@ -98,6 +104,7 @@ impl GuiApp {
             spectrum_chart,
             waterfall_chart,
             thread_started: false,
+            sim_thread,
             signal_db,
             noise_db,
             interval_ms: DEFAULT_INTERVAL_MS,
@@ -163,7 +170,8 @@ impl eframe::App for GuiApp {
             self.thread_started = true;
             let shared = self.shared.clone();
             let ctx2   = ctx.clone();
-            std::thread::spawn(move || sim_loop(shared, Some(ctx2)));
+            *self.sim_thread.lock().unwrap() =
+                Some(std::thread::spawn(move || sim_loop(shared, Some(ctx2))));
         }
 
         let running = self.shared.running.load(Ordering::Relaxed);
@@ -452,5 +460,13 @@ impl eframe::App for GuiApp {
         });
 
         // Repaint is driven by the sim thread via ctx.request_repaint().
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Signal the sim thread to exit.  `running` alone won't do it — false
+        // there means "paused, keep looping".  `quit` is the actual exit flag.
+        // The join happens in main() after run_native returns so the window
+        // closes immediately without freezing.
+        self.shared.quit.store(true, Ordering::Relaxed);
     }
 }

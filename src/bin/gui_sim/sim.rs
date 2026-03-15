@@ -114,6 +114,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     loop {
         let tick_start = Instant::now();
 
+        if shared.quit.load(Ordering::Relaxed) { break; }
         if !shared.running.load(Ordering::Relaxed) {
             std::thread::sleep(TICK);
             continue;

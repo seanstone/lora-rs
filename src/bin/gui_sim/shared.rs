@@ -41,6 +41,8 @@ pub(crate) struct SimShared {
     pub rebuild_driver:  AtomicBool,
     /// True while UHD device initialisation is in progress.
     pub uhd_loading:     AtomicBool,
+    /// Set by on_exit to make the sim thread break out of its loop and exit.
+    pub quit:            AtomicBool,
 }
 
 #[derive(Default, Clone)]
