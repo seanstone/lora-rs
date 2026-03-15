@@ -12,7 +12,7 @@ use super::{
     DEFAULT_SF, DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FFT_SIZE,
     DEFAULT_SIGNAL_DB, DEFAULT_NOISE_DB, DEFAULT_INTERVAL_MS,
     SR_OPTIONS_KHZ, BW_OPTIONS_KHZ,
-    khz_label, effective_sr_and_os, snr_db, waterfall_total_secs, WATERFALL_HEIGHT,
+    khz_label, effective_sr_and_os, snr_db, waterfall_total_secs,
 };
 
 pub(crate) struct GuiApp {
@@ -74,7 +74,6 @@ impl GuiApp {
         let (eff_sr, _) = effective_sr_and_os(samp_rate_khz, bw_khz);
         let wf_total = waterfall_total_secs(eff_sr, fft_size);
         waterfall_chart.set_y_time_display(wf_total);
-        let wf_spr = (wf_total / WATERFALL_HEIGHT as f64) as f32;
 
         let shared = Arc::new(SimShared {
             running:        AtomicBool::new(true),
@@ -102,7 +101,6 @@ impl GuiApp {
             rebuild_driver: AtomicBool::new(false),
             uhd_loading:    AtomicBool::new(false),
             quit:           AtomicBool::new(false),
-            waterfall_secs_per_row: AtomicU32::new(wf_spr.to_bits()),
         });
 
         Self {
@@ -157,8 +155,6 @@ impl GuiApp {
         self.waterfall_chart.set_x_limits([0.0, self.fft_size as f64]);
         let wf_total = waterfall_total_secs(eff_sr, self.fft_size);
         self.waterfall_chart.set_y_time_display(wf_total);
-        self.shared.waterfall_secs_per_row
-            .store(((wf_total / WATERFALL_HEIGHT as f64) as f32).to_bits(), Ordering::Relaxed);
         *self.shared.sf.lock().unwrap()            = self.sf;
         *self.shared.os_factor.lock().unwrap()     = os_factor;
         *self.shared.samp_rate_khz.lock().unwrap() = eff_sr;

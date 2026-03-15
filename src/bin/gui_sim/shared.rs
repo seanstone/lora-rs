@@ -43,9 +43,6 @@ pub(crate) struct SimShared {
     pub uhd_loading:     AtomicBool,
     /// Set by on_exit to make the sim thread break out of its loop and exit.
     pub quit:            AtomicBool,
-    /// Measured seconds per waterfall row (f32 bits). Updated each sim tick.
-    /// Used by the GUI to show accurate time labels on the waterfall Y axis.
-    pub waterfall_secs_per_row: AtomicU32,
 }
 
 #[derive(Default, Clone)]
