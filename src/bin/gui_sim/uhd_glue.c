@@ -73,6 +73,49 @@ int uhd_glue_open(const char *args,
     return 0;
 }
 
+/* Rebuild both RX and TX streamers in-place.
+ *
+ * Must be called after uhd_glue_set_rx_rate / uhd_glue_set_tx_rate, because
+ * UHD streamers are bound to the decimation chain that was active when
+ * uhd_usrp_get_rx/tx_stream() was called.  Changing the sample rate without
+ * recreating the streamer leaves it stale — recv() returns 0 indefinitely.
+ *
+ * Safe to call while streaming is stopped (after uhd_glue_stop_rx). */
+void uhd_glue_rebuild_streams(void)
+{
+    /* ── RX ── */
+    if (g_rx_streamer) { uhd_rx_streamer_free(&g_rx_streamer); g_rx_streamer = NULL; }
+    uhd_rx_streamer_make(&g_rx_streamer);
+    {
+        size_t rx_ch = 0;
+        uhd_stream_args_t rx_args = {
+            .cpu_format   = "sc16",
+            .otw_format   = "sc16",
+            .args         = "",
+            .channel_list = &rx_ch,
+            .n_channels   = 1
+        };
+        uhd_usrp_get_rx_stream(g_usrp, &rx_args, g_rx_streamer);
+        uhd_rx_streamer_max_num_samps(g_rx_streamer, &g_rx_buf_size);
+    }
+
+    /* ── TX ── */
+    if (g_tx_streamer) { uhd_tx_streamer_free(&g_tx_streamer); g_tx_streamer = NULL; }
+    uhd_tx_streamer_make(&g_tx_streamer);
+    {
+        size_t tx_ch = 0;
+        uhd_stream_args_t tx_args = {
+            .cpu_format   = "sc16",
+            .otw_format   = "sc16",
+            .args         = "",
+            .channel_list = &tx_ch,
+            .n_channels   = 1
+        };
+        uhd_usrp_get_tx_stream(g_usrp, &tx_args, g_tx_streamer);
+        uhd_tx_streamer_max_num_samps(g_tx_streamer, &g_tx_buf_size);
+    }
+}
+
 void uhd_glue_close(void)
 {
     if (g_rx_metadata)  uhd_rx_metadata_free(&g_rx_metadata);

@@ -31,6 +31,9 @@ mod ffi {
 
         pub fn uhd_glue_start_rx();
         pub fn uhd_glue_stop_rx();
+        /// Rebuild RX and TX streamers after a sample-rate change.
+        /// Must be called before uhd_glue_start_rx() whenever the rate changed.
+        pub fn uhd_glue_rebuild_streams();
 
         pub fn uhd_glue_recv(buf: *mut   i16, n: usize) -> usize;
         pub fn uhd_glue_send(buf: *const i16, n: usize) -> usize;
@@ -44,18 +47,22 @@ mod ffi {
 
 pub(crate) struct UhdDevice {
     /// Interleaved i16 I/Q pairs queued for the TX thread.
-    tx_queue:   Arc<Mutex<VecDeque<i16>>>,
+    tx_queue:      Arc<Mutex<VecDeque<i16>>>,
     /// Received f32 I/Q samples accumulated by the RX thread.
-    rx_buffer:  Arc<Mutex<VecDeque<Complex<f32>>>>,
+    rx_buffer:     Arc<Mutex<VecDeque<Complex<f32>>>>,
     /// Digital TX amplitude scaling (applied when f32 → i16).
-    signal_amp: Arc<Mutex<f32>>,
+    signal_amp:    Arc<Mutex<f32>>,
     /// Signals worker threads to exit.
-    running:    Arc<AtomicBool>,
+    running:       Arc<AtomicBool>,
     /// When false the RX thread idles without calling uhd_glue_recv (parked).
-    streaming:  Arc<AtomicBool>,
+    streaming:     Arc<AtomicBool>,
+    /// Held by the TX thread for the duration of each uhd_glue_send() call.
+    /// unpark() acquires this before rebuild_streams() to guarantee no
+    /// concurrent access to g_tx_streamer while it is being freed/recreated.
+    tx_send_lock:  Arc<Mutex<()>>,
     /// Worker thread handles — joined in Drop before closing UHD handles.
-    tx_thread:  Option<JoinHandle<()>>,
-    rx_thread:  Option<JoinHandle<()>>,
+    tx_thread:     Option<JoinHandle<()>>,
+    rx_thread:     Option<JoinHandle<()>>,
 }
 
 impl UhdDevice {
@@ -94,18 +101,20 @@ impl UhdDevice {
             ffi::uhd_glue_start_rx();
         }
 
-        let tx_queue   = Arc::new(Mutex::new(VecDeque::<i16>::new()));
-        let rx_buffer  = Arc::new(Mutex::new(VecDeque::<Complex<f32>>::new()));
-        let signal_amp = Arc::new(Mutex::new(1.0f32));
-        let running    = Arc::new(AtomicBool::new(true));
-        let streaming  = Arc::new(AtomicBool::new(true));
+        let tx_queue     = Arc::new(Mutex::new(VecDeque::<i16>::new()));
+        let rx_buffer    = Arc::new(Mutex::new(VecDeque::<Complex<f32>>::new()));
+        let signal_amp   = Arc::new(Mutex::new(1.0f32));
+        let running      = Arc::new(AtomicBool::new(true));
+        let streaming    = Arc::new(AtomicBool::new(true));
+        let tx_send_lock = Arc::new(Mutex::new(()));
 
         // ── TX worker ─────────────────────────────────────────────────────────
         // Drains the tx_queue in chunks of tx_buf_size; pads with zeros when
         // the queue is empty so the hardware TX stream never stalls.
         let tx_thread = {
-            let tx_q = tx_queue.clone();
-            let run  = running.clone();
+            let tx_q      = tx_queue.clone();
+            let run       = running.clone();
+            let send_lock = tx_send_lock.clone();
             std::thread::spawn(move || {
                 let buf_size    = tx_buf_size.max(1024);
                 let needed_i16  = buf_size * 2;
@@ -117,6 +126,7 @@ impl UhdDevice {
                         for b in send_buf[..avail].iter_mut() { *b = q.pop_front().unwrap(); }
                         for b in send_buf[avail..].iter_mut() { *b = 0; }
                     }
+                    let _guard = send_lock.lock().unwrap();
                     unsafe { ffi::uhd_glue_send(send_buf.as_ptr(), buf_size); }
                 }
             })
@@ -150,7 +160,7 @@ impl UhdDevice {
             })
         };
 
-        Ok(Self { tx_queue, rx_buffer, signal_amp, running, streaming,
+        Ok(Self { tx_queue, rx_buffer, signal_amp, running, streaming, tx_send_lock,
                   tx_thread: Some(tx_thread), rx_thread: Some(rx_thread) })
     }
 }
@@ -242,7 +252,15 @@ impl Driver for UhdDevice {
             ffi::uhd_glue_set_rx_freq(freq_hz); ffi::uhd_glue_set_rx_gain(rx_gain_db);
             ffi::uhd_glue_set_tx_rate(sr_hz);   ffi::uhd_glue_set_tx_bw(bw_hz);
             ffi::uhd_glue_set_tx_freq(freq_hz); ffi::uhd_glue_set_tx_gain(tx_gain_db);
-            ffi::uhd_glue_start_rx();
+        }
+        // Hold tx_send_lock while rebuilding streamers so the TX thread cannot
+        // call uhd_glue_send() on g_tx_streamer while it is being freed/recreated.
+        {
+            let _guard = self.tx_send_lock.lock().unwrap();
+            unsafe {
+                ffi::uhd_glue_rebuild_streams();
+                ffi::uhd_glue_start_rx();
+            }
         }
         self.streaming.store(true, Ordering::Relaxed);
         self.rx_buffer.lock().unwrap().clear();
