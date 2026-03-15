@@ -48,9 +48,18 @@ fn symbol_bin(
         .unwrap_or(0)
 }
 
+/// Are two FFT bins within ±1 (mod n)?
+fn bins_close(a: usize, b: usize, n: usize) -> bool {
+    a == b || (a + 1) % n == b || (b + 1) % n == a
+}
+
 /// Detect a LoRa preamble in `samples` and return the raw payload IQ windows.
 ///
-/// `os_factor = samp_rate / bw`. Each symbol occupies `2^sf * os_factor` samples.
+/// Works on **arbitrarily aligned** streams: the preamble's upchirps are
+/// periodic, so every sps-strided window within the preamble produces the
+/// *same* FFT bin — the bin value encodes the fractional chirp offset.
+/// We detect `n_up_req` consecutive windows with a consistent bin and use
+/// the circular mean of those bins to compute the precise alignment.
 pub fn frame_sync(
     samples:      &[Complex<f32>],
     sf:           u8,
@@ -69,17 +78,46 @@ pub fn frame_sync(
     let mut buf            = vec![Complex::new(0.0_f32, 0.0_f32); n];
     let mut consec         = 0usize;
     let mut preamble_start = 0usize;
+    let mut preamble_bin   = 0usize;
+
+    // Circular accumulator for sub-bin precision via circular mean.
+    let mut sin_sum = 0.0_f64;
+    let mut cos_sum = 0.0_f64;
 
     let mut w = 0usize;
     while w + sps <= samples.len() {
-        let bin   = symbol_bin(&mut buf, &samples[w..w + sps], os_factor as usize, &downchirp, fft.as_ref());
-        let is_up = bin <= 1 || bin >= n - 1;
+        let bin = symbol_bin(&mut buf, &samples[w..w + sps], os_factor as usize, &downchirp, fft.as_ref());
 
-        if is_up {
-            if consec == 0 { preamble_start = w; }
+        if consec == 0 {
+            // Start a new candidate preamble run.
+            preamble_start = w;
+            preamble_bin   = bin;
+            consec         = 1;
+            let angle = TAU * bin as f64 / n as f64;
+            sin_sum = angle.sin();
+            cos_sum = angle.cos();
+        } else if bins_close(bin, preamble_bin, n) {
             consec += 1;
+            let angle = TAU * bin as f64 / n as f64;
+            sin_sum += angle.sin();
+            cos_sum += angle.cos();
+
             if consec >= n_up_req {
-                let payload_start = preamble_start + (preamble_len as usize + 4) * sps + sps / 4;
+                // ── Preamble found — compute aligned payload start ────────
+                // Circular mean of the detected bins for sub-bin precision.
+                let mean_angle = sin_sum.atan2(cos_sum);
+                let mean_bin   = ((mean_angle / TAU * n as f64).round() as isize)
+                    .rem_euclid(n as isize) as usize;
+
+                // A dechirped upchirp at fractional offset d produces FFT
+                // bin = (N − d/os_factor) mod N.  Invert to recover d.
+                let d = ((n - mean_bin) % n) * os_factor as usize;
+
+                let aligned_start = preamble_start + d;
+                let payload_start = aligned_start
+                    + (preamble_len as usize + 4) * sps
+                    + sps / 4;
+
                 if payload_start + sps <= samples.len() {
                     let len = ((samples.len() - payload_start) / sps) * sps;
                     return FrameSyncResult {
@@ -92,7 +130,13 @@ pub fn frame_sync(
                 return FrameSyncResult { found: false, symbols: vec![], consumed: preamble_start };
             }
         } else {
-            consec = 0;
+            // Bin changed — restart the run from this window.
+            preamble_start = w;
+            preamble_bin   = bin;
+            consec         = 1;
+            let angle = TAU * bin as f64 / n as f64;
+            sin_sum = angle.sin();
+            cos_sum = angle.cos();
         }
         w += sps;
     }

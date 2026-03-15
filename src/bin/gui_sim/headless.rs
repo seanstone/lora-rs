@@ -7,22 +7,32 @@ use std::{
 
 use super::shared::{SimShared, Stats};
 use super::sim::sim_loop;
-use super::{DEFAULT_SIGNAL_DB, DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FFT_SIZE,
-            effective_sr_and_os};
+use super::{
+    DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FFT_SIZE,
+    DEFAULT_SIGNAL_DB, DEFAULT_INTERVAL_MS,
+    effective_sr_and_os,
+};
 
-/// Run the simulator headlessly and print per-packet results to stdout.
+/// Run the simulator headlessly with the **same** shared-state defaults as
+/// GUI mode (sample rate, BW, FFT size, signal/noise levels, interval).
 ///
-/// Useful for automated tests and CI: exits once `packet_count` packets have
-/// been accounted for on the RX side (decoded + lost).
+/// The sim_loop is spawned identically to how `GuiApp` spawns it, except
+/// no egui context is passed (so no display worker). This makes headless
+/// output directly comparable to what the GUI would show.
 pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
+    // ── Same defaults as GuiApp::new ─────────────────────────────────────────
+    let samp_rate_khz = DEFAULT_SAMP_RATE_KHZ;
+    let bw_khz        = DEFAULT_BW_KHZ;
+    let (eff_sr, os_factor) = effective_sr_and_os(samp_rate_khz, bw_khz);
+    let fft_size  = DEFAULT_FFT_SIZE;
     let signal_db = DEFAULT_SIGNAL_DB;
     let noise_db  = signal_db - snr_db_val;
-    let (eff_sr, os_factor) = effective_sr_and_os(DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ);
-    let fft_size = DEFAULT_FFT_SIZE;
 
     let init_spec: Vec<[f64; 2]> = (0..fft_size).map(|i| [i as f64, -80.0]).collect();
     let spectrum_plot  = SpectrumPlot::new("Spectrum",   init_spec.clone(), -80.0, 80.0);
     let waterfall_plot = WaterfallPlot::new("Waterfall", init_spec,         -80.0);
+    waterfall_plot.set_freq(fft_size as f64 / 2.0);
+    waterfall_plot.set_bw(fft_size as f64);
 
     let shared = Arc::new(SimShared {
         running:        AtomicBool::new(true),
@@ -33,7 +43,7 @@ pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
         fft_size:       Mutex::new(fft_size),
         signal_db:      Mutex::new(signal_db),
         noise_db:       Mutex::new(noise_db),
-        interval_ms:    Mutex::new(0),   // back-to-back packets
+        interval_ms:    Mutex::new(DEFAULT_INTERVAL_MS),
         spectrum_plot,
         waterfall_plot,
         stats:          Mutex::new(Stats::default()),
@@ -58,7 +68,7 @@ pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
         let stats = shared.stats.lock().unwrap().clone();
         if stats.tx_count >= packet_count {
             // Give the RX pipeline time to drain remaining packets.
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs(2));
             let log = shared.log.lock().unwrap().clone();
             for entry in log.iter().skip(printed) {
                 let mark = if entry.ok { "OK  " } else { "FAIL" };
