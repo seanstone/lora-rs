@@ -160,7 +160,7 @@ size_t uhd_glue_recv(int16_t *buf, size_t n)
     void   *buffers[1] = { buf };
     size_t  items_recvd = 0;
     uhd_rx_streamer_recv(g_rx_streamer, buffers, n,
-                         &g_rx_metadata, 3.0, 0, &items_recvd);
+                         &g_rx_metadata, 0.1, 0, &items_recvd);
     return items_recvd;
 }
 

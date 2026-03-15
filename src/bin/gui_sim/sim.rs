@@ -116,6 +116,9 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         let should_clear   = shared.clear_buf.swap(false, Ordering::Relaxed);
         if should_rebuild || should_clear {
             if should_rebuild {
+                // Drop the old driver first so its UHD handles are closed
+                // before make_driver opens new ones (C glue uses global state).
+                driver = Box::new(Channel::new(0.0, 1.0));
                 driver = make_driver(&shared);
             } else {
                 driver.clear();

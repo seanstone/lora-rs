@@ -3,6 +3,7 @@ use std::{
     collections::VecDeque,
     ffi::CString,
     sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    thread::JoinHandle,
 };
 
 use super::driver::Driver;
@@ -50,6 +51,9 @@ pub(crate) struct UhdDevice {
     signal_amp: Arc<Mutex<f32>>,
     /// Signals worker threads to exit.
     running:    Arc<AtomicBool>,
+    /// Worker thread handles — joined in Drop before closing UHD handles.
+    tx_thread:  Option<JoinHandle<()>>,
+    rx_thread:  Option<JoinHandle<()>>,
 }
 
 impl UhdDevice {
@@ -96,7 +100,7 @@ impl UhdDevice {
         // ── TX worker ─────────────────────────────────────────────────────────
         // Drains the tx_queue in chunks of tx_buf_size; pads with zeros when
         // the queue is empty so the hardware TX stream never stalls.
-        {
+        let tx_thread = {
             let tx_q = tx_queue.clone();
             let run  = running.clone();
             std::thread::spawn(move || {
@@ -112,13 +116,13 @@ impl UhdDevice {
                     }
                     unsafe { ffi::uhd_glue_send(send_buf.as_ptr(), buf_size); }
                 }
-            });
-        }
+            })
+        };
 
         // ── RX worker ─────────────────────────────────────────────────────────
-        // Calls uhd_glue_recv in a loop; converts sc16 → Complex<f32> and
-        // appends to rx_buffer.
-        {
+        // Calls uhd_glue_recv in a loop (0.1 s timeout); converts sc16 →
+        // Complex<f32> and appends to rx_buffer.
+        let rx_thread = {
             let rx_buf = rx_buffer.clone();
             let run    = running.clone();
             std::thread::spawn(move || {
@@ -134,17 +138,25 @@ impl UhdDevice {
                         rx_buf.lock().unwrap().extend(samples);
                     }
                 }
-            });
-        }
+            })
+        };
 
-        Ok(Self { tx_queue, rx_buffer, signal_amp, running })
+        Ok(Self { tx_queue, rx_buffer, signal_amp, running,
+                  tx_thread: Some(tx_thread), rx_thread: Some(rx_thread) })
     }
 }
 
 impl Drop for UhdDevice {
     fn drop(&mut self) {
+        // Signal threads to stop and issue a stream-stop so uhd_glue_recv
+        // returns promptly (0.1 s timeout) rather than blocking up to 3 s.
         self.running.store(false, Ordering::Relaxed);
-        unsafe { ffi::uhd_glue_stop_rx(); ffi::uhd_glue_close(); }
+        unsafe { ffi::uhd_glue_stop_rx(); }
+        // Wait for both threads to finish before freeing UHD handles —
+        // otherwise they may call uhd_glue_send/recv on freed pointers.
+        if let Some(h) = self.tx_thread.take() { let _ = h.join(); }
+        if let Some(h) = self.rx_thread.take() { let _ = h.join(); }
+        unsafe { ffi::uhd_glue_close(); }
     }
 }
 
