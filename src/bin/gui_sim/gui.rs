@@ -21,6 +21,8 @@ pub(crate) struct GuiApp {
     waterfall_chart: Chart,
     thread_started:  bool,
     /// Shared with `main()` so the join can happen after the window closes.
+    /// Not present on WASM — the sim task runs on the JS event loop.
+    #[cfg(not(target_arch = "wasm32"))]
     sim_thread:      Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     /// Last known X bounds — used to detect which chart panned/zoomed so we
     /// can copy the new range to the other chart next frame.
@@ -42,6 +44,7 @@ pub(crate) struct GuiApp {
 impl GuiApp {
     pub fn new(
         sf: u8,
+        #[cfg(not(target_arch = "wasm32"))]
         sim_thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     ) -> Self {
         let samp_rate_khz  = DEFAULT_SAMP_RATE_KHZ;
@@ -108,6 +111,7 @@ impl GuiApp {
             spectrum_chart,
             waterfall_chart,
             thread_started: false,
+            #[cfg(not(target_arch = "wasm32"))]
             sim_thread,
             last_synced_x:  [0.0, fft_size as f64],
             signal_db,
@@ -193,8 +197,18 @@ impl eframe::App for GuiApp {
             self.thread_started = true;
             let shared = self.shared.clone();
             let ctx2   = ctx.clone();
-            *self.sim_thread.lock().unwrap() =
-                Some(std::thread::spawn(move || sim_loop(shared, Some(ctx2))));
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(3)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                *self.sim_thread.lock().unwrap() =
+                    Some(std::thread::spawn(move || rt.block_on(sim_loop(shared, Some(ctx2)))));
+            }
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(sim_loop(shared, Some(ctx2)));
         }
 
         let running = self.shared.running.load(Ordering::Relaxed);

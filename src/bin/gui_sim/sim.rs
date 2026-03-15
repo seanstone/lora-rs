@@ -2,7 +2,7 @@ use eframe::egui;
 use std::{
     collections::VecDeque,
     sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::channel::Channel;
@@ -49,68 +49,71 @@ pub(crate) const TICK: Duration = Duration::from_millis(16);
 const MAX_ROWS_PER_TICK: usize = 128;
 
 /// Number of packets to keep pre-modulated in the TX pipeline.
-/// Needs to cover the worst case of ceil(tick / packet_duration) + 1.
-/// SF7 at 4 MSPS: packet ≈ 7.7 ms, tick = 16 ms → ~3 packets/tick → depth 4.
 const TX_PIPELINE_DEPTH: usize = 4;
 
-pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
+/// Sleep for the remainder of a tick, or a full tick on WASM.
+async fn tick_sleep(remaining: Duration) {
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(remaining).await;
+    #[cfg(target_arch = "wasm32")]
+    gloo_timers::future::TimeoutFuture::new(remaining.as_millis() as u32).await;
+}
+
+/// Spawn a task on the appropriate executor.
+/// Native: tokio thread-pool (requires Send). WASM: JS event loop.
+fn spawn_task<F>(f: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = tokio::task::spawn(f); }
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(f);
+}
+
+pub(crate) async fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     let payloads: &[&[u8]] = &[
         b"Hello, LoRa!", b"Rust 2024", b"AWGN channel",
         b"burst test",   b"lora-rs",   b"packet!",
     ];
     let mut payload_idx = 0usize;
     let mut seq         = 0u16;
-    let mut tx_gen         = 0u64;   // tx_generation counter — incremented on reset
+    let mut tx_gen      = 0u64;
 
-    // Virtual sample clock.
     let mut produced_samples: u64 = 0;
     let mut next_packet_at:   u64 = 0;
     let mut last_interval_ms: u64 = u64::MAX;
-    // Track UHD gain values so we only call into hardware on change.
     let mut last_uhd_rx_gain = f64::NAN;
     let mut last_uhd_tx_gain = f64::NAN;
-    // Pre-modulated packets ready to push into the channel.
     let mut tx_queue: VecDeque<TxResult> = VecDeque::new();
-    // Jobs sent to the TX worker that haven't produced a result yet.
     let mut jobs_in_flight: usize = 0;
 
-    // Spawn worker threads.
-    let (rx_send,     rx_recv)     = std::sync::mpsc::channel::<RxJob>();
-    let (tx_job_send, tx_job_recv) = std::sync::mpsc::channel::<TxJob>();
-    let (tx_res_send, tx_res_recv) = std::sync::mpsc::channel::<TxResult>();
-    { let s = shared.clone(); std::thread::spawn(move || rx_worker(rx_recv, s)); }
-    std::thread::spawn(move || tx_worker(tx_job_recv, tx_res_send));
+    // Spawn worker tasks.
+    let (rx_send,     rx_recv)     = tokio::sync::mpsc::unbounded_channel::<RxJob>();
+    let (tx_job_send, tx_job_recv) = tokio::sync::mpsc::unbounded_channel::<TxJob>();
+    let (tx_res_send, tx_res_recv) = tokio::sync::mpsc::unbounded_channel::<TxResult>();
+    { let s = shared.clone(); spawn_task(rx_worker(rx_recv, s)); }
+    spawn_task(tx_worker(tx_job_recv, tx_res_send));
 
-    // Display thread is only needed in GUI mode.
-    // Bounded so the backlog never grows beyond ~4 ticks of windows.  At 4 MHz
-    // the sim loop sends ~62 windows/tick; 256 slots caps the pipeline delay to
-    // ≤4 ticks (~64 ms).  Excess windows are silently dropped — the waterfall
-    // may skip frames when the worker is busy but the gain/signal changes remain
-    // visible within one or two ticks rather than building up seconds of lag.
-    let disp_send: Option<std::sync::mpsc::SyncSender<DisplayJob>> = if ctx.is_some() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<DisplayJob>(256);
-        { let s = shared.clone(); std::thread::spawn(move || display_worker(rx, s)); }
+    // Display task is only needed in GUI mode.
+    let disp_send: Option<tokio::sync::mpsc::Sender<DisplayJob>> = if ctx.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DisplayJob>(256);
+        { let s = shared.clone(); spawn_task(display_worker(rx, s)); }
         Some(tx)
     } else {
         None
     };
 
+    // Mutable tx_res_recv — must be declared after spawn_task calls above.
+    let mut tx_res_recv = tx_res_recv;
+
     let mut driver: Box<dyn Driver> = make_driver(&shared);
-    // Samples not yet consumed by a complete FFT window, carried across ticks.
-    // Without this, floor(n/fft_size) truncation discards up to fft_size-1
-    // samples per tick, making the display run slower than signal time.
     let mut display_carry: Vec<rustfft::num_complex::Complex<f32>> = Vec::new();
-    // Parked UHD device kept alive while the sim channel is active so it can
-    // be resumed without re-opening the hardware.  The String is the args the
-    // device was opened with — if they change we discard the cache.
     #[cfg(feature = "uhd")]
     let mut parked_uhd: Option<(Box<dyn Driver>, String)> = None;
-    // Args string the currently-active UHD driver was opened with.  Used to
-    // distinguish a fast SR/BW reconfigure (same args) from a full re-open.
     #[cfg(feature = "uhd")]
     let mut active_uhd_args: String = String::new();
 
-    // Build a numbered payload: [seq_le16][text].
     macro_rules! dispatch_tx {
         ($sf:expr, $os:expr) => {{
             let text = payloads[payload_idx % payloads.len()];
@@ -125,15 +128,15 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     }
 
     loop {
-        let tick_start = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let tick_start = std::time::Instant::now();
 
         if shared.quit.load(Ordering::Relaxed) { break; }
         if !shared.running.load(Ordering::Relaxed) {
-            std::thread::sleep(TICK);
+            tick_sleep(TICK).await;
             continue;
         }
 
-        // Rebuild driver on UHD settings change; flush on any settings change.
         let should_rebuild = shared.rebuild_driver.swap(false, Ordering::Relaxed);
         let should_clear   = shared.clear_buf.swap(false, Ordering::Relaxed);
         if should_rebuild || should_clear {
@@ -143,7 +146,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                     let use_uhd = shared.use_uhd.load(Ordering::Relaxed);
                     let cur_args = shared.uhd_args.lock().unwrap().clone();
                     if use_uhd {
-                        // ── Activate / reconfigure UHD ───────────────────────
                         let freq  = *shared.uhd_freq_hz.lock().unwrap();
                         let rxg   = *shared.uhd_rx_gain_db.lock().unwrap();
                         let txg   = *shared.uhd_tx_gain_db.lock().unwrap();
@@ -151,10 +153,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                         let bw_hz = sr_hz / *shared.os_factor.lock().unwrap() as f64;
 
                         if driver.is_parkable() && active_uhd_args == cur_args {
-                            // UHD already active with the same args (e.g. SR/BW
-                            // changed) — stop streaming, apply new rates, restart.
-                            // This avoids a full close+reopen which would race
-                            // with the background uhd_glue_close() thread.
                             driver.park();
                             driver.unpark(freq, sr_hz, bw_hz, rxg, txg);
                         } else {
@@ -167,8 +165,8 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                                 dev.unpark(freq, sr_hz, bw_hz, rxg, txg);
                                 driver = dev;
                             } else {
-                                parked_uhd = None; // drop stale cached device
-                                driver = Box::new(Channel::new(0.0, 1.0)); // close current first
+                                parked_uhd = None;
+                                driver = Box::new(Channel::new(0.0, 1.0));
                                 shared.uhd_loading.store(true, Ordering::Relaxed);
                                 if let Some(ref c) = ctx { c.request_repaint(); }
                                 let result = UhdDevice::new(&cur_args, freq, sr_hz, bw_hz, rxg, txg);
@@ -186,7 +184,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                         last_uhd_rx_gain = f64::NAN;
                         last_uhd_tx_gain = f64::NAN;
                     } else {
-                        // ── Park UHD or switch to sim ────────────────────────
                         if driver.is_parkable() {
                             let noise = db_to_amp(*shared.noise_db.lock().unwrap()) / std::f32::consts::SQRT_2;
                             let sig   = db_to_amp(*shared.signal_db.lock().unwrap());
@@ -229,11 +226,9 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         let signal_amp  = db_to_amp(signal_db);
         let noise_sigma = db_to_amp(noise_db) / std::f32::consts::SQRT_2;
 
-        // Push current levels into the driver — applied per-sample in tick().
         driver.set_noise_sigma(noise_sigma);
         driver.set_signal_amp(signal_amp);
 
-        // Apply hardware gains on change (no-op for sim channel).
         let uhd_rx_gain = *shared.uhd_rx_gain_db.lock().unwrap();
         let uhd_tx_gain = *shared.uhd_tx_gain_db.lock().unwrap();
         if uhd_rx_gain != last_uhd_rx_gain { last_uhd_rx_gain = uhd_rx_gain; driver.set_hw_rx_gain(uhd_rx_gain); }
@@ -248,23 +243,15 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             next_packet_at   = produced_samples;
         }
 
-        // ── TX scheduler ─────────────────────────────────────────────────
-        // Collect all completed modulation results into the local queue.
         while let Ok(res) = tx_res_recv.try_recv() {
             jobs_in_flight = jobs_in_flight.saturating_sub(1);
             if res.tx_gen == tx_gen {
                 tx_queue.push_back(res);
             }
-            // Stale result from before a reset — silently discard.
         }
 
-        // ── Push packets into the driver ──────────────────────────────────
-        // Hard cap: never let the driver buffer grow beyond 4 ticks of samples
-        // (prevents tx_count racing ahead of rx_count at interval=0).
-        let max_pending      = samples_per_tick as usize * 4;
-        // Fill target for interval=0: keep at least one full tick pre-buffered
-        // so the driver never runs dry mid-tick (which would create silence gaps).
-        let fill_target      = samples_per_tick as usize;
+        let max_pending = samples_per_tick as usize * 4;
+        let fill_target = samples_per_tick as usize;
 
         let mut starved = false;
         if next_packet_at <= produced_samples {
@@ -282,8 +269,6 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                         driver.push_samples(res.clean);
                         next_packet_at = produced_samples + interval_samples;
 
-                        // For non-zero intervals: one push per interval tick.
-                        // For interval=0: keep looping until the fill target is met.
                         if interval_samples > 0 { break; }
                         if driver.pending_samples() >= fill_target { break; }
                     }
@@ -293,32 +278,20 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         }
         shared.tx_starved.store(starved, Ordering::Relaxed);
 
-        // Replenish the pipeline based on what the push loop just consumed.
-        // Dispatch must happen *after* the push so we see the post-push queue
-        // depth and send exactly as many new jobs as were consumed this tick.
         while tx_queue.len() + jobs_in_flight < TX_PIPELINE_DEPTH {
             dispatch_tx!(sf, os_factor);
         }
 
-        // ── Driver tick: produce one tick's worth of mixed samples ────────
         let n     = samples_per_tick as usize;
         let mixed = driver.tick(n);
-        // Advance by actual length: hardware drivers may return more than n
-        // (they drain all buffered samples to prevent backlog accumulation).
         produced_samples += mixed.len() as u64;
 
-        // ── Mixed samples → RX worker (continuous stream) ────────────────
         let _ = rx_send.send(RxJob {
             sf, cr: 4, os_factor,
             samples: mixed.clone(),
             tx_gen,
         });
 
-        // ── Mixed samples → display thread ───────────────────────────────
-        // Prepend carry from last tick so samples straddling tick boundaries
-        // form complete FFT windows.  Without this, floor(n/fft_size) truncation
-        // discards up to fft_size-1 samples per tick, causing the waterfall to
-        // scroll slower than signal time by up to 2× for large FFT sizes.
         display_carry.extend_from_slice(&mixed);
         let avail_rows = display_carry.len() / fft_size;
         let rows       = avail_rows.min(MAX_ROWS_PER_TICK);
@@ -329,26 +302,22 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
                     let is_last = i + 1 == rows;
                     let window = display_carry[i * fft_size..(i + 1) * fft_size].to_vec();
                     if is_last {
-                        let _ = ds.send((window, true));
+                        let _ = ds.send((window, true)).await;
                     } else if ds.try_send((window, false)).is_err() {
                         let last = display_carry[(rows-1)*fft_size..rows*fft_size].to_vec();
-                        let _ = ds.send((last, true));
+                        let _ = ds.send((last, true)).await;
                         break;
                     }
                 }
             } else {
-                // Accumulating — no complete window yet.  Send a silent is_last
-                // so the spectrum plot still refreshes this tick.
                 let len = display_carry.len().min(fft_size);
                 let mut w = display_carry[..len].to_vec();
                 w.resize(fft_size, rustfft::num_complex::Complex::new(0.0, 0.0));
-                let _ = ds.send((w, true));
+                let _ = ds.send((w, true)).await;
             }
         }
-        // Retain only the unconsumed tail for the next tick.
         display_carry.drain(..rows * fft_size);
 
-        // ── Buffer status ─────────────────────────────────────────────────
         let pending   = driver.pending_samples();
         let lag_ms    = pending as f32 * 1000.0 / samp_rate_hz as f32;
         let overflow  = mixed.len() / fft_size > (n / fft_size).max(1) * 8;
@@ -362,7 +331,13 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
 
         if let Some(ref c) = ctx { c.request_repaint(); }
 
-        let elapsed = tick_start.elapsed();
-        if elapsed < TICK { std::thread::sleep(TICK - elapsed); }
+        // Sleep for the remainder of the tick.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let elapsed = tick_start.elapsed();
+            if elapsed < TICK { tick_sleep(TICK - elapsed).await; }
+        }
+        #[cfg(target_arch = "wasm32")]
+        tick_sleep(TICK).await;
     }
 }

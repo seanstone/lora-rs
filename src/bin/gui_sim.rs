@@ -31,7 +31,10 @@
 #[path = "gui_sim/display.rs"]  mod display;
 #[path = "gui_sim/sim.rs"]      mod sim;
 #[path = "gui_sim/gui.rs"]      mod gui;
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "gui_sim/headless.rs"] mod headless;
+#[cfg(feature = "wasm")]
+#[path = "gui_sim/wasm.rs"]     mod wasm_entry;
 
 // ─── Shared constants ─────────────────────────────────────────────────────────
 
@@ -78,6 +81,11 @@ pub(crate) fn waterfall_total_secs(samp_rate_khz: u32, fft_size: usize) -> f64 {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
+/// On WASM the real entry point is `wasm_entry::start` (wasm_bindgen(start)).
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cli_mode = args.iter().any(|a| a == "--cli" || a == "-c");

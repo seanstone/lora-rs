@@ -33,7 +33,7 @@ pub(crate) fn spectrum_window(
 /// Spectrum: updated once per tick with the **peak-hold** across all rows in
 /// that tick — ensures the signal is visible even when a packet occupies only
 /// a fraction of the tick (common at high sample rates / short SF).
-pub(crate) fn display_worker(jobs: std::sync::mpsc::Receiver<DisplayJob>, shared: Arc<SimShared>) {
+pub(crate) async fn display_worker(mut jobs: tokio::sync::mpsc::Receiver<DisplayJob>, shared: Arc<SimShared>) {
     let mut cur_fft_size = 0usize;
     let mut hann: Vec<f32>             = Vec::new();
     let mut fft_buf: Vec<Complex<f32>> = Vec::new();
@@ -42,7 +42,7 @@ pub(crate) fn display_worker(jobs: std::sync::mpsc::Receiver<DisplayJob>, shared
     // Per-bin peak-hold accumulator for the current tick.
     let mut peak: Vec<[f64; 2]> = Vec::new();
 
-    while let Ok((window, is_last)) = jobs.recv() {
+    while let Some((window, is_last)) = jobs.recv().await {
         let fft_size = window.len();
         if fft_size != cur_fft_size {
             cur_fft_size = fft_size;

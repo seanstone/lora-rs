@@ -7,13 +7,40 @@ license = "GPL-3.0-only"
 [features]
 default = ["uhd"]
 uhd = []
+wasm = [
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+    "dep:tracing",
+    "dep:tracing-wasm",
+    "dep:tracing-subscriber",
+    "dep:gloo-timers",
+]
 
 [build-dependencies]
 cc = "1"
 
 [dependencies]
-rustfft  = "6.4.1"
-rand     = { version = "0.10.0", features = ["std_rng"] }
-egui     = "0.33.0"
-eframe   = { version = "0.33.0", default-features = false, features = ["default_fonts", "glow"] }
+rustfft   = "6.4.1"
+rand      = { version = "0.10.0", features = ["std_rng"] }
+egui      = "0.33.0"
+eframe    = { version = "0.33.0", default-features = false, features = ["default_fonts", "glow"] }
 egui_plot = "0.34.0"
+tokio     = { version = "1", default-features = false, features = ["sync"] }
+
+# Optional: wasm only
+wasm-bindgen             = { version = "0.2",  optional = true }
+wasm-bindgen-futures     = { version = "0.4",  optional = true }
+web-sys                  = { version = "0.3",  optional = true, features = ["Window", "Document", "HtmlCanvasElement"] }
+console_error_panic_hook = { version = "0.1",  optional = true }
+tracing                  = { version = "0.1",  optional = true }
+tracing-wasm             = { version = "0.2",  optional = true }
+tracing-subscriber       = { version = "0.3",  optional = true, default-features = false, features = ["registry"] }
+gloo-timers              = { version = "0.3",  optional = true, features = ["futures"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

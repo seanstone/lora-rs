@@ -120,7 +120,7 @@ const MAX_RX_BUFFER: usize = 1 << 22; // ~4 M samples, ~32 MB
 /// - **Incomplete**: keep the preamble — the full payload hasn't arrived yet.
 /// - **Failed**: drain to `payload_start` (skip the false/corrupt preamble),
 ///   let the next scan skip through the garbled payload.
-pub(crate) fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimShared>) {
+pub(crate) async fn rx_worker(mut jobs: tokio::sync::mpsc::UnboundedReceiver<RxJob>, shared: Arc<SimShared>) {
     let mut rx       = Rx::new(7, 4, 4);
     let mut buffer:  Vec<Complex<f32>> = Vec::new();
     let mut next_seq: u16 = 0;
@@ -130,7 +130,7 @@ pub(crate) fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimS
     // like spurious loss).
     let mut resync = true;
 
-    while let Ok(job) = jobs.recv() {
+    while let Some(job) = jobs.recv().await {
         // Re-create decoder on settings change.
         if job.sf != rx.sf || job.os_factor != rx.os_factor {
             rx = Rx::new(job.sf, job.cr, job.os_factor);
