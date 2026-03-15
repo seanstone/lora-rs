@@ -115,3 +115,11 @@ TX  ──►  Channel (AWGN)  ──►  RX
 | `gui.rs` | egui/eframe application |
 | `headless.rs` | CLI runner |
 | `shared.rs` | `SimShared` — thread-safe state shared across all workers |
+
+## Credits
+
+This work was inspired by [gr-lora_sdr](https://github.com/tapparelj/gr-lora_sdr) by Tapparel Joachim et al., a GNU Radio implementation of the LoRa PHY layer, and in turn by [gr-lora](https://github.com/rpp0/gr-lora) by Pieter Robyns, Peter Quax, Wim Lamotte, and William Thenaers, whose architecture and demodulation approach informed the design of this implementation.
+
+## License
+
+Distributed under the GPL-3.0 License. See [LICENSE](LICENSE) for more information.
