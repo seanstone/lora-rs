@@ -127,10 +127,11 @@ impl Chart {
 
         if let Some(mut scroll) = scroll {
             scroll = Vec2::splat(scroll.x + scroll.y);
+            const ZOOM_SPEED: f32 = 2.0;
             let mut zoom = if modifiers.shift {
-                Vec2::from([(scroll.x * 0.1 / 10.0).exp(), (scroll.y * 0.1 / 10.0).exp()])
+                Vec2::from([(scroll.x * ZOOM_SPEED / 10.0).exp(), (scroll.y * ZOOM_SPEED / 10.0).exp()])
             } else {
-                Vec2::from([(scroll.x * 0.1 / 10.0).exp(), 1.0])
+                Vec2::from([(scroll.x * ZOOM_SPEED / 10.0).exp(), 1.0])
             };
             let xspan = bounds.max()[0] - bounds.min()[0];
             let yspan = bounds.max()[1] - bounds.min()[1];
@@ -138,7 +139,9 @@ impl Chart {
             if zoom[1] < 1. && yspan >= self.y_limits[1] - self.y_limits[0] { zoom[1] = 1.; }
             if zoom[0] > 1. && xspan <= self.x_min_span * zoom[0] as f64 { zoom[0] = (xspan / self.x_min_span) as f32; }
             if zoom[1] > 1. && yspan <= self.y_min_span * zoom[1] as f64 { zoom[1] = (yspan / self.y_min_span) as f32; }
-            plot_ui.zoom_bounds_around_hovered(zoom);
+            if let Some(pos) = plot_ui.pointer_coordinate() {
+                plot_ui.zoom_bounds(zoom, pos);
+            }
         }
 
         if plot_ui.response().hovered() && pointer_down {
