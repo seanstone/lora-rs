@@ -456,6 +456,21 @@ impl eframe::App for GuiApp {
                     });
             });
 
+        // Update x-axis label mode: MHz when UHD is active, bins otherwise.
+        #[cfg(feature = "uhd")]
+        {
+            if self.shared.use_uhd.load(Ordering::Relaxed) {
+                let center_hz = *self.shared.uhd_freq_hz.lock().unwrap();
+                let bw_hz     = self.bw_khz as f64 * 1000.0;
+                let fft       = self.fft_size;
+                self.spectrum_chart .set_x_freq_display(center_hz, bw_hz, fft);
+                self.waterfall_chart.set_x_freq_display(center_hz, bw_hz, fft);
+            } else {
+                self.spectrum_chart .clear_x_freq_display();
+                self.waterfall_chart.clear_x_freq_display();
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let h = ui.available_height();
             let w = ui.available_width();

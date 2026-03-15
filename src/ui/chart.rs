@@ -1,5 +1,5 @@
 use egui::{Event, Vec2, Vec2b, Id};
-use egui_plot::{Legend, Plot, PlotBounds, GridMark, AxisHints};
+use egui_plot::{Legend, Plot, PlotBounds, GridMark, GridInput, AxisHints};
 use std::sync::{Arc, Mutex};
 use std::ops::RangeInclusive;
 use crate::ui::Plottable;
@@ -17,6 +17,9 @@ pub struct Chart {
     y_min_span:    f64,
     link_axis:     (Id, Vec2b),
     link_cursor:   (Id, Vec2b),
+    /// When Some, x-axis labels show MHz instead of bin indices.
+    /// (offset_mhz, scale_mhz_per_bin) where freq = offset + bin * scale.
+    x_freq:        Option<(f64, f64)>,
 }
 
 impl Chart {
@@ -34,8 +37,19 @@ impl Chart {
             y_min_span:    5.0,
             link_axis:     (Id::new(""), Vec2b::new(false, false)),
             link_cursor:   (Id::new(""), Vec2b::new(false, false)),
+            x_freq:        None,
         }
     }
+
+    /// Show frequency (MHz) on the x-axis instead of FFT bin indices.
+    /// Call every frame while in UHD mode; pass `None` to revert to bins.
+    pub fn set_x_freq_display(&mut self, center_hz: f64, bw_hz: f64, fft_size: usize) {
+        let scale  = bw_hz / fft_size as f64 / 1e6;
+        let offset = (center_hz - bw_hz / 2.0) / 1e6;
+        self.x_freq = Some((offset, scale));
+    }
+
+    pub fn clear_x_freq_display(&mut self) { self.x_freq = None; }
 
     pub fn add(&mut self, item: Arc<dyn Plottable>) {
         self.plots.lock().unwrap().push(item);
@@ -80,10 +94,11 @@ impl Chart {
 
         let plots   = self.plots.clone();
         let plot_id = self.name.clone();
+        let x_freq  = self.x_freq;
         let plot    = Plot::new(plot_id)
             .legend(Legend::default())
             .show_axes(true)
-            .custom_x_axes(Self::x_axes())
+            .custom_x_axes(self.x_axes())
             .custom_y_axes(Self::y_axes())
             .show_grid(true)
             .allow_drag(false)
@@ -97,6 +112,12 @@ impl Chart {
                     .collect::<Vec<_>>()
                     .join("")
             });
+        // Conditionally attach the freq-aligned grid spacer.
+        let plot = if let Some((offset, scale)) = x_freq {
+            plot.x_grid_spacer(move |input| x_grid_freq(input, offset, scale))
+        } else {
+            plot
+        };
 
         plot.show(ui, |plot_ui| {
             self.handle_bounds(plot_ui);
@@ -107,8 +128,12 @@ impl Chart {
         });
     }
 
-    fn x_axes() -> Vec<AxisHints<'static>> {
-        let fmt = |mark: GridMark, _: &RangeInclusive<f64>| format!("{:.0}", mark.value);
+    fn x_axes(&self) -> Vec<AxisHints<'static>> {
+        let freq = self.x_freq;
+        let fmt = move |mark: GridMark, _: &RangeInclusive<f64>| match freq {
+            Some((offset, scale)) => format!("{:.3}", offset + mark.value * scale),
+            None                  => format!("{:.0}", mark.value),
+        };
         vec![AxisHints::new_x().formatter(fmt).placement(egui_plot::VPlacement::Bottom)]
     }
 
@@ -176,4 +201,48 @@ impl Chart {
         self.last_x_bounds = xb;
         self.last_y_bounds = yb;
     }
+}
+
+/// X grid spacer for frequency-display mode.
+/// Emits exactly two levels: major (3–8 visible lines) and minor (major/5).
+/// egui_plot renders minor lines at lower alpha because their step_size is
+/// smaller relative to the major step_size.
+fn x_grid_freq(input: GridInput, offset_mhz: f64, scale_mhz_per_bin: f64) -> Vec<GridMark> {
+    let (min_bin, max_bin) = input.bounds;
+    let min_mhz = offset_mhz + min_bin * scale_mhz_per_bin;
+    let max_mhz = offset_mhz + max_bin * scale_mhz_per_bin;
+    let span    = (max_mhz - min_mhz).abs();
+
+    // Coarse candidates (major lines), largest first.
+    let candidates = [
+        100.0_f64, 50.0, 25.0, 10.0, 5.0, 2.5, 1.0,
+        0.5, 0.25, 0.1, 0.05, 0.025, 0.01, 0.005, 0.001,
+    ];
+    // Major: first (largest) step that still gives ≥ 3 lines (step ≤ span/3).
+    let major_mhz = candidates.iter().copied()
+        .find(|&s| s <= span / 3.0)
+        .unwrap_or(candidates[candidates.len() - 1]);
+    let minor_mhz = major_mhz / 5.0;
+
+    let major_bins = major_mhz / scale_mhz_per_bin;
+    let minor_bins = minor_mhz / scale_mhz_per_bin;
+
+    let mut marks = vec![];
+    // Major lines — full prominence (largest step_size).
+    let i_min = (min_mhz / major_mhz).floor() as i64;
+    let i_max = (max_mhz / major_mhz).ceil()  as i64;
+    for i in i_min..=i_max {
+        let bin = (i as f64 * major_mhz - offset_mhz) / scale_mhz_per_bin;
+        marks.push(GridMark { value: bin, step_size: major_bins });
+    }
+    // Minor lines — lower prominence because step_size is 5× smaller,
+    // so egui_plot renders them at proportionally lower alpha.
+    let i_min = (min_mhz / minor_mhz).floor() as i64;
+    let i_max = (max_mhz / minor_mhz).ceil()  as i64;
+    for i in i_min..=i_max {
+        if i % 5 == 0 { continue; } // skip positions already covered by major
+        let bin = (i as f64 * minor_mhz - offset_mhz) / scale_mhz_per_bin;
+        marks.push(GridMark { value: bin, step_size: minor_bins });
+    }
+    marks
 }
