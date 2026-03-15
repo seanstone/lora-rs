@@ -222,7 +222,9 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         // ── Driver tick: produce one tick's worth of mixed samples ────────
         let n     = samples_per_tick as usize;
         let mixed = driver.tick(n);
-        produced_samples += n as u64;
+        // Advance by actual length: hardware drivers may return more than n
+        // (they drain all buffered samples to prevent backlog accumulation).
+        produced_samples += mixed.len() as u64;
 
         // ── Mixed samples → RX worker (continuous stream) ────────────────
         let _ = rx_send.send(RxJob {

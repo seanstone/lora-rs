@@ -171,21 +171,21 @@ impl Driver for UhdDevice {
         }
     }
 
-    /// Block until at least `n` received samples are available, then drain them.
+    /// Block until at least `n` samples are available, then drain ALL buffered
+    /// samples and return them.
     ///
-    /// Any backlog beyond `n` is discarded so we always return the freshest
-    /// samples.  Without this, processing overhead causes the buffer to grow
-    /// steadily (the hardware delivers samples slightly faster than the sim
-    /// loop drains them), producing seconds of latency over time.
+    /// Returning everything (not just n) is important: the sim loop's cycle
+    /// time (hardware wait + processing) slightly exceeds TICK, so the hardware
+    /// delivers a few hundred extra samples per iteration.  Draining exactly n
+    /// would let the buffer grow without bound, accumulating seconds of lag.
+    /// Draining all ensures no backlog builds up between ticks.
     fn tick(&mut self, n: usize) -> Vec<Complex<f32>> {
         loop {
             if self.rx_buffer.lock().unwrap().len() >= n { break; }
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
         let mut buf = self.rx_buffer.lock().unwrap();
-        let discard = buf.len().saturating_sub(n);
-        if discard > 0 { buf.drain(..discard); }
-        buf.drain(..n).collect()
+        buf.drain(..).collect()
     }
 
     /// Number of i16 values in the TX queue, expressed as complex samples.
