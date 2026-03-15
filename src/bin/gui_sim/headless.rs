@@ -20,9 +20,11 @@ use super::{
 /// no egui context is passed (so no display worker). This makes headless
 /// output directly comparable to what the GUI would show.
 pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
-    // ── Same defaults as GuiApp::new ─────────────────────────────────────────
-    let samp_rate_khz = DEFAULT_SAMP_RATE_KHZ;
-    let bw_khz        = DEFAULT_BW_KHZ;
+    // ── Same defaults as GuiApp::new (override via env for testing) ─────────
+    let samp_rate_khz = std::env::var("SR_KHZ").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SAMP_RATE_KHZ);
+    let bw_khz = std::env::var("BW_KHZ").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_BW_KHZ);
     let (eff_sr, os_factor) = effective_sr_and_os(samp_rate_khz, bw_khz);
     let fft_size  = DEFAULT_FFT_SIZE;
     let signal_db = DEFAULT_SIGNAL_DB;
@@ -43,7 +45,8 @@ pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
         fft_size:       Mutex::new(fft_size),
         signal_db:      Mutex::new(signal_db),
         noise_db:       Mutex::new(noise_db),
-        interval_ms:    Mutex::new(DEFAULT_INTERVAL_MS),
+        interval_ms:    Mutex::new(std::env::var("INTERVAL_MS").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL_MS)),
         spectrum_plot,
         waterfall_plot,
         stats:          Mutex::new(Stats::default()),

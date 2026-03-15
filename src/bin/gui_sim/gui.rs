@@ -312,7 +312,8 @@ impl eframe::App for GuiApp {
                         if ui.button("↺ Reset").clicked() {
                             *self.shared.stats.lock().unwrap() = Stats::default();
                             self.shared.log.lock().unwrap().clear();
-                        }
+                            self.shared.clear_buf.store(true, Ordering::Relaxed);
+                                            }
                     });
                 });
                 ui.separator();

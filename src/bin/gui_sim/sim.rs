@@ -25,6 +25,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     ];
     let mut payload_idx = 0usize;
     let mut seq         = 0u16;
+    let mut tx_gen         = 0u64;   // tx_generation counter — incremented on reset
 
     // Virtual sample clock.
     let mut produced_samples: u64 = 0;
@@ -67,7 +68,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             payload.extend_from_slice(&seq.to_le_bytes());
             payload.extend_from_slice(text);
             seq = seq.wrapping_add(1);
-            let _ = tx_job_send.send(TxJob { sf: $sf, cr: 4, os_factor: $os, payload });
+            let _ = tx_job_send.send(TxJob { sf: $sf, cr: 4, os_factor: $os, payload, tx_gen });
             tx_inflight = true;
         }};
     }
@@ -87,6 +88,9 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             produced_samples = 0;
             next_packet_at   = 0;
             last_interval_ms = u64::MAX;
+            seq              = 0;
+            payload_idx      = 0;
+            tx_gen             += 1;
             while tx_res_recv.try_recv().is_ok() {}
             tx_inflight = false;
         }
@@ -122,13 +126,20 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         // Collect completed modulation result into the buffer.
         if tx_buffered.is_none() {
             if let Ok(res) = tx_res_recv.try_recv() {
-                tx_buffered = Some(res);
-                dispatch_tx!(sf, os_factor);   // pre-build the next one
+                if res.tx_gen == tx_gen {
+                    tx_buffered = Some(res);
+                    dispatch_tx!(sf, os_factor);   // pre-build the next one
+                }
+                // Stale result from before a reset — silently discard.
             }
         }
 
-        // Push samples into the channel when the interval has elapsed.
-        if next_packet_at <= produced_samples {
+        // Push samples into the channel when the interval has elapsed and
+        // the channel isn't overloaded.  Without this gate, interval=0 would
+        // pile up an unbounded backlog — tx_count races ahead of rx_count
+        // even though no packets are actually lost.
+        let max_pending = samples_per_tick as usize * 4;
+        if next_packet_at <= produced_samples && channel.pending_samples() <= max_pending {
             if let Some(res) = tx_buffered.take() {
                 let pkt_seq  = u16::from_le_bytes([res.payload[0], res.payload[1]]);
                 let pkt_text = String::from_utf8_lossy(&res.payload[2..]).to_string();
@@ -151,6 +162,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         let _ = rx_send.send(RxJob {
             sf, cr: 4, os_factor,
             samples: mixed.clone(),
+            tx_gen,
         });
 
         // ── Mixed samples → display thread ───────────────────────────────

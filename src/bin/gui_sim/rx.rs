@@ -104,6 +104,7 @@ pub(crate) struct RxJob {
     pub cr:        u8,
     pub os_factor: u32,
     pub samples:   Vec<Complex<f32>>,
+    pub tx_gen:    u64,
 }
 
 /// Cap on the internal RX buffer to prevent unbounded growth at very low SNR.
@@ -123,11 +124,21 @@ pub(crate) fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimS
     let mut rx       = Rx::new(7, 4, 4);
     let mut buffer:  Vec<Complex<f32>> = Vec::new();
     let mut next_seq: u16 = 0;
+    let mut rx_gen:  u64 = 0;
 
     while let Ok(job) = jobs.recv() {
         // Re-create decoder on settings change.
         if job.sf != rx.sf || job.os_factor != rx.os_factor {
             rx = Rx::new(job.sf, job.cr, job.os_factor);
+            buffer.clear();
+            next_seq = 0;
+        }
+
+        // Discard stale samples from before a reset — the generation
+        // counter is bumped by the sim loop on every clear_buf, so any
+        // RxJobs queued before the reset carry the old generation.
+        if job.tx_gen != rx_gen {
+            rx_gen   = job.tx_gen;
             buffer.clear();
             next_seq = 0;
         }

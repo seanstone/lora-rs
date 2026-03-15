@@ -47,12 +47,14 @@ pub(crate) struct TxJob {
     pub cr:        u8,
     pub os_factor: u32,
     pub payload:   Vec<u8>,
+    pub tx_gen:       u64,
 }
 
 /// Clean (noise-free, unit-amplitude) modulated packet.
 pub(crate) struct TxResult {
     pub payload: Vec<u8>,
     pub clean:   Vec<Complex<f32>>,
+    pub tx_gen:     u64,
 }
 
 /// Runs LoRa modulation off the sim_loop critical path.
@@ -67,6 +69,6 @@ pub(crate) fn tx_worker(
             tx = Tx::new(job.sf, job.cr, job.os_factor);
         }
         let clean = tx.modulate(&job.payload);
-        let _ = results.send(TxResult { payload: job.payload, clean });
+        let _ = results.send(TxResult { payload: job.payload, clean, tx_gen: job.tx_gen });
     }
 }

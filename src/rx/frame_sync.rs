@@ -117,10 +117,36 @@ pub fn frame_sync(
                 // bin = (N − d/os_factor) mod N.  Invert to recover d.
                 let d = ((n - mean_bin) % n) * os_factor as usize;
 
-                let aligned_start = preamble_start + d;
-                let payload_start = aligned_start
-                    + (preamble_len as usize + 4) * sps
-                    + sps / 4;
+                // Scan forward past remaining upchirps to find the end
+                // of the preamble (first non-upchirp window = sync word).
+                // This is robust regardless of which chirp started the run.
+                let mut end_w = w + sps;
+                while end_w + sps <= samples.len() {
+                    let next_bin = symbol_bin(
+                        &mut buf,
+                        &samples[end_w..end_w + sps],
+                        os_factor as usize, &downchirp, fft.as_ref(),
+                    );
+                    if bins_close(next_bin, preamble_bin, n) {
+                        end_w += sps;
+                    } else {
+                        break;
+                    }
+                }
+                eprintln!("[sync] pre_start={preamble_start} w={w} end_w={end_w} upchirps={} d={d} buf={}",
+                          (end_w - preamble_start) / sps, samples.len());
+                // end_w = first non-upchirp window in the sps-stride scan.
+                //
+                // When d < sps/2: the sync word begins inside window [end_w..end_w+sps]
+                //   at offset d  →  sync_start = end_w + d.
+                // When d ≥ sps/2: the previous window [end_w-sps..end_w] still looked
+                //   like an upchirp (upchirp portion d > sps/2 dominated), so the sync
+                //   word actually started one window earlier at offset d within it
+                //   →  sync_start = end_w + d - sps.
+                //
+                // Payload follows: 2 sync symbols + 2.25 SFD symbols = 4.25 sps.
+                let sync_start = if 2 * d < sps { end_w + d } else { end_w + d - sps };
+                let payload_start = sync_start + 4 * sps + sps / 4;
 
                 if payload_start + sps <= samples.len() {
                     let len = ((samples.len() - payload_start) / sps) * sps;
