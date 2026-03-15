@@ -54,6 +54,7 @@ pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
         buf_lag_ms:     AtomicU32::new(0),
         buf_overflow:   AtomicBool::new(false),
         buf_underflow:  AtomicBool::new(false),
+        tx_starved:     AtomicBool::new(false),
     });
 
     { let s = shared.clone(); std::thread::spawn(move || sim_loop(s, None)); }

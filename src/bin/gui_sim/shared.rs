@@ -22,6 +22,9 @@ pub(crate) struct SimShared {
     pub buf_lag_ms:     AtomicU32,
     pub buf_overflow:   AtomicBool,
     pub buf_underflow:  AtomicBool,
+    /// True when the TX scheduler wants to push a packet but the modulator
+    /// hasn't finished yet — TX can't fill the requested interval rate.
+    pub tx_starved:     AtomicBool,
 }
 
 #[derive(Default, Clone)]

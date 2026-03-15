@@ -61,7 +61,7 @@ pub(crate) struct TxResult {
 /// Produces clean IQ only — AWGN is applied per-sample by the Channel.
 pub(crate) fn tx_worker(
     jobs:    std::sync::mpsc::Receiver<TxJob>,
-    results: std::sync::mpsc::SyncSender<TxResult>,
+    results: std::sync::mpsc::Sender<TxResult>,
 ) {
     let mut tx = Tx::new(7, 4, 4);
     for job in jobs {

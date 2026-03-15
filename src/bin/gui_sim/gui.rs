@@ -78,6 +78,7 @@ impl GuiApp {
             buf_lag_ms:     AtomicU32::new(0),
             buf_overflow:   AtomicBool::new(false),
             buf_underflow:  AtomicBool::new(false),
+            tx_starved:     AtomicBool::new(false),
         });
 
         Self {
@@ -274,6 +275,7 @@ impl eframe::App for GuiApp {
                 let lag_ms    = f32::from_bits(self.shared.buf_lag_ms  .load(Ordering::Relaxed));
                 let overflow  = self.shared.buf_overflow .load(Ordering::Relaxed);
                 let underflow = self.shared.buf_underflow.load(Ordering::Relaxed);
+                let tx_starved = self.shared.tx_starved  .load(Ordering::Relaxed);
 
                 let (color, label) = if underflow {
                     (egui::Color32::from_rgb(220, 160, 0), "⚠ UNDERFLOW")
@@ -284,6 +286,14 @@ impl eframe::App for GuiApp {
                 };
                 ui.colored_label(color, label);
                 ui.label(format!("buf {lag_ms:.0} ms"));
+
+                if tx_starved {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 160, 0),
+                        "⚠ TX slow",
+                    ).on_hover_text("TX modulator can't keep up with the requested interval — gaps in the IQ stream");
+                }
             });
         });
 

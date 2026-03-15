@@ -1,5 +1,6 @@
 use eframe::egui;
 use std::{
+    collections::VecDeque,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -18,6 +19,11 @@ pub(crate) const TICK: Duration = Duration::from_millis(16);
 /// high sample rates.
 const MAX_ROWS_PER_TICK: usize = 128;
 
+/// Number of packets to keep pre-modulated in the TX pipeline.
+/// Needs to cover the worst case of ceil(tick / packet_duration) + 1.
+/// SF7 at 4 MSPS: packet ≈ 7.7 ms, tick = 16 ms → ~3 packets/tick → depth 4.
+const TX_PIPELINE_DEPTH: usize = 4;
+
 pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     let payloads: &[&[u8]] = &[
         b"Hello, LoRa!", b"Rust 2024", b"AWGN channel",
@@ -31,15 +37,15 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     let mut produced_samples: u64 = 0;
     let mut next_packet_at:   u64 = 0;
     let mut last_interval_ms: u64 = u64::MAX;
-    // true while a TxJob is being processed by the worker thread.
-    let mut tx_inflight = false;
-    // Completed TxResult waiting to be pushed to the channel at the right time.
-    let mut tx_buffered: Option<TxResult> = None;
+    // Pre-modulated packets ready to push into the channel.
+    let mut tx_queue: VecDeque<TxResult> = VecDeque::new();
+    // Jobs sent to the TX worker that haven't produced a result yet.
+    let mut jobs_in_flight: usize = 0;
 
     // Spawn worker threads.
     let (rx_send,     rx_recv)     = std::sync::mpsc::channel::<RxJob>();
     let (tx_job_send, tx_job_recv) = std::sync::mpsc::channel::<TxJob>();
-    let (tx_res_send, tx_res_recv) = std::sync::mpsc::sync_channel::<TxResult>(1);
+    let (tx_res_send, tx_res_recv) = std::sync::mpsc::channel::<TxResult>();
     { let s = shared.clone(); std::thread::spawn(move || rx_worker(rx_recv, s)); }
     std::thread::spawn(move || tx_worker(tx_job_recv, tx_res_send));
 
@@ -69,7 +75,7 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             payload.extend_from_slice(text);
             seq = seq.wrapping_add(1);
             let _ = tx_job_send.send(TxJob { sf: $sf, cr: 4, os_factor: $os, payload, tx_gen });
-            tx_inflight = true;
+            jobs_in_flight += 1;
         }};
     }
 
@@ -84,15 +90,15 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         // Flush channel on settings change; reset virtual clock.
         if shared.clear_buf.swap(false, Ordering::Relaxed) {
             channel.clear();
-            tx_buffered      = None;
+            tx_queue.clear();
+            while tx_res_recv.try_recv().is_ok() {}
+            jobs_in_flight   = 0;
             produced_samples = 0;
             next_packet_at   = 0;
             last_interval_ms = u64::MAX;
             seq              = 0;
             payload_idx      = 0;
-            tx_gen             += 1;
-            while tx_res_recv.try_recv().is_ok() {}
-            tx_inflight = false;
+            tx_gen           += 1;
         }
 
         let sf            = *shared.sf.lock().unwrap();
@@ -120,38 +126,54 @@ pub(crate) fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         }
 
         // ── TX scheduler ─────────────────────────────────────────────────
-        // Keep the modulation worker one packet ahead.
-        if !tx_inflight { dispatch_tx!(sf, os_factor); }
-
-        // Collect completed modulation result into the buffer.
-        if tx_buffered.is_none() {
-            if let Ok(res) = tx_res_recv.try_recv() {
-                if res.tx_gen == tx_gen {
-                    tx_buffered = Some(res);
-                    dispatch_tx!(sf, os_factor);   // pre-build the next one
-                }
-                // Stale result from before a reset — silently discard.
+        // Collect all completed modulation results into the local queue.
+        while let Ok(res) = tx_res_recv.try_recv() {
+            jobs_in_flight = jobs_in_flight.saturating_sub(1);
+            if res.tx_gen == tx_gen {
+                tx_queue.push_back(res);
             }
+            // Stale result from before a reset — silently discard.
         }
 
-        // Push samples into the channel when the interval has elapsed and
-        // the channel isn't overloaded.  Without this gate, interval=0 would
-        // pile up an unbounded backlog — tx_count races ahead of rx_count
-        // even though no packets are actually lost.
-        let max_pending = samples_per_tick as usize * 4;
-        if next_packet_at <= produced_samples && channel.pending_samples() <= max_pending {
-            if let Some(res) = tx_buffered.take() {
-                let pkt_seq  = u16::from_le_bytes([res.payload[0], res.payload[1]]);
-                let pkt_text = String::from_utf8_lossy(&res.payload[2..]).to_string();
-                {
-                    let mut s = shared.stats.lock().unwrap();
-                    s.tx_count += 1;
-                    s.last_tx = format!("#{pkt_seq} {pkt_text}");
+        // Keep TX_PIPELINE_DEPTH jobs dispatched ahead of the queue.
+        while tx_queue.len() + jobs_in_flight < TX_PIPELINE_DEPTH {
+            dispatch_tx!(sf, os_factor);
+        }
+
+        // ── Push packets into the channel ─────────────────────────────────
+        // Hard cap: never let the channel buffer grow beyond 4 ticks of samples
+        // (prevents tx_count racing ahead of rx_count at interval=0).
+        let max_pending      = samples_per_tick as usize * 4;
+        // Fill target for interval=0: keep at least one full tick pre-buffered
+        // so the channel never runs dry mid-tick (which would create silence gaps).
+        let fill_target      = samples_per_tick as usize;
+
+        let mut starved = false;
+        if next_packet_at <= produced_samples {
+            loop {
+                if channel.pending_samples() >= max_pending { break; }
+                match tx_queue.pop_front() {
+                    Some(res) => {
+                        let pkt_seq  = u16::from_le_bytes([res.payload[0], res.payload[1]]);
+                        let pkt_text = String::from_utf8_lossy(&res.payload[2..]).to_string();
+                        {
+                            let mut s = shared.stats.lock().unwrap();
+                            s.tx_count += 1;
+                            s.last_tx   = format!("#{pkt_seq} {pkt_text}");
+                        }
+                        channel.push_samples(res.clean);
+                        next_packet_at = produced_samples + interval_samples;
+
+                        // For non-zero intervals: one push per interval tick.
+                        // For interval=0: keep looping until the fill target is met.
+                        if interval_samples > 0 { break; }
+                        if channel.pending_samples() >= fill_target { break; }
+                    }
+                    None => { starved = true; break; }
                 }
-                channel.push_samples(res.clean);
-                next_packet_at = produced_samples + interval_samples;
             }
         }
+        shared.tx_starved.store(starved, Ordering::Relaxed);
 
         // ── Channel tick: produce one tick's worth of mixed samples ───────
         let n     = samples_per_tick as usize;
