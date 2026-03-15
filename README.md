@@ -2,6 +2,8 @@
 
 A LoRa modulation/demodulation library and real-time link simulator written in Rust.
 
+**[Live demo](https://seanstone.github.io/lora-rs)** — runs entirely in the browser via WebAssembly, no install needed.
+
 Implements the full LoRa PHY pipeline — whitening, explicit header, CRC-16, Hamming FEC, interleaving, gray coding, chirp up/down modulation — and runs it as a live GUI with a spectrum analyzer, time-calibrated waterfall, and a scrolling decode log. Optionally drives real USRP hardware via UHD.
 
 ## Screenshot
