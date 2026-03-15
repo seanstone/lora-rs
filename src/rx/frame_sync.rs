@@ -96,7 +96,11 @@ pub fn frame_sync(
             let angle = TAU * bin as f64 / n as f64;
             sin_sum = angle.sin();
             cos_sum = angle.cos();
-        } else if bins_close(bin, preamble_bin, n) {
+        } else if (consec == 1 && bin == preamble_bin)
+               || (consec >= 2 && bins_close(bin, preamble_bin, n)) {
+            // First two windows must match exactly to avoid contaminated
+            // partial-chirp windows anchoring preamble_start too early.
+            // After two exact matches, allow ±1 for noise tolerance.
             consec += 1;
             let angle = TAU * bin as f64 / n as f64;
             sin_sum += angle.sin();
