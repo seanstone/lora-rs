@@ -87,8 +87,8 @@ impl GuiApp {
             use_uhd:        AtomicBool::new(false),
             uhd_args:       Mutex::new(String::new()),
             uhd_freq_hz:    Mutex::new(915e6),
-            uhd_rx_gain_db: Mutex::new(30.0),
-            uhd_tx_gain_db: Mutex::new(30.0),
+            uhd_rx_gain_db: Mutex::new(40.0),
+            uhd_tx_gain_db: Mutex::new(40.0),
             rebuild_driver: AtomicBool::new(false),
         });
 
@@ -106,8 +106,8 @@ impl GuiApp {
             fft_size,
             uhd_args:       String::new(),
             uhd_freq_mhz:   915.0,
-            uhd_rx_gain_db: 30.0,
-            uhd_tx_gain_db: 30.0,
+            uhd_rx_gain_db: 40.0,
+            uhd_tx_gain_db: 40.0,
         }
     }
 
