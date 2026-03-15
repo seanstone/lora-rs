@@ -350,15 +350,15 @@ impl eframe::App for GuiApp {
                     ui.separator();
 
                     ui.label("RX gain:");
-                    if ui.add_sized([80.0, h], egui::DragValue::new(&mut self.uhd_rx_gain_db)
-                        .speed(0.5).suffix(" dB").range(0.0..=76.0)).changed()
+                    if ui.add_sized([120.0, h], Slider::new(&mut self.uhd_rx_gain_db, 0.0..=76.0)
+                        .suffix(" dB").step_by(0.5)).changed()
                     {
                         uhd_changed = true;
                     }
 
                     ui.label("TX gain:");
-                    if ui.add_sized([80.0, h], egui::DragValue::new(&mut self.uhd_tx_gain_db)
-                        .speed(0.5).suffix(" dB").range(0.0..=89.0)).changed()
+                    if ui.add_sized([120.0, h], Slider::new(&mut self.uhd_tx_gain_db, 0.0..=89.0)
+                        .suffix(" dB").step_by(0.5)).changed()
                     {
                         uhd_changed = true;
                     }
