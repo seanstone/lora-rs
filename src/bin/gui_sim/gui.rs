@@ -377,8 +377,7 @@ impl eframe::App for GuiApp {
         });
 
         egui::SidePanel::right("msg_log")
-            .min_width(200.0)
-            .default_width(260.0)
+            .exact_width(260.0)
             .show(ctx, |ui| {
                 ui.heading("Messages");
                 ui.separator();
