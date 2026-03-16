@@ -1,47 +1,4 @@
-use lora::tx::{
-    whitening::whiten, header::add_header, crc::add_crc,
-    hamming_enc::hamming_enc, interleaver::interleave,
-    gray_demap::gray_demap, modulate::modulate,
-};
-use rustfft::num_complex::Complex;
-
-// ─── LoRa modulator ───────────────────────────────────────────────────────────
-
-pub(crate) struct Tx {
-    pub sf:           u8,
-    pub cr:           u8,
-    pub os_factor:    u32,
-    pub sync_word:    u8,
-    pub preamble_len: u16,
-}
-
-impl Tx {
-    pub fn new(sf: u8, cr: u8, os_factor: u32, sync_word: u8, preamble_len: u16) -> Self {
-        Self { sf, cr, os_factor, sync_word, preamble_len }
-    }
-
-    /// Produce clean (noise-free, unit-amplitude) LoRa IQ samples.
-    pub fn modulate(&self, payload: &[u8]) -> Vec<Complex<f32>> {
-        let nibbles   = whiten(payload);
-        let framed    = add_header(&nibbles, false, true, self.cr);
-        let with_crc  = add_crc(&framed, payload, true);
-        let padded    = pad_nibbles(&with_crc, self.sf, false);
-        let codewords = hamming_enc(&padded, self.cr, self.sf);
-        let symbols   = interleave(&codewords, self.cr, self.sf, false);
-        let chirps    = gray_demap(&symbols, self.sf);
-        modulate(&chirps, self.sf, self.sync_word, self.preamble_len, self.os_factor)
-    }
-}
-
-fn pad_nibbles(nibbles: &[u8], sf: u8, ldro: bool) -> Vec<u8> {
-    let pay_sf    = if ldro { (sf - 2) as usize } else { sf as usize };
-    let header_cw = (sf - 2) as usize;
-    let remaining = nibbles.len().saturating_sub(header_cw);
-    let pad       = (pay_sf - remaining % pay_sf) % pay_sf;
-    let mut v     = nibbles.to_vec();
-    v.resize(v.len() + pad, 0);
-    v
-}
+pub(crate) use lora::modem::Tx;
 
 // ─── Worker thread ────────────────────────────────────────────────────────────
 
@@ -59,8 +16,8 @@ pub(crate) struct TxJob {
 /// Clean (noise-free, unit-amplitude) modulated packet.
 pub(crate) struct TxResult {
     pub payload: Vec<u8>,
-    pub clean:   Vec<Complex<f32>>,
-    pub tx_gen:     u64,
+    pub clean:   Vec<rustfft::num_complex::Complex<f32>>,
+    pub tx_gen:  u64,
 }
 
 /// Runs LoRa modulation off the sim_loop critical path.
