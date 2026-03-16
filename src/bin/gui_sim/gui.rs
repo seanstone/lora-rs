@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU32, Ordering}},
 };
 
-use super::shared::{SimShared, Stats};
+use super::shared::{LogEntry, SimShared, Stats};
 use super::sim::sim_loop;
 use super::{
     DEFAULT_SF, DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FFT_SIZE,
@@ -14,6 +14,10 @@ use super::{
     SR_OPTIONS_KHZ, BW_OPTIONS_KHZ,
     khz_label, effective_sr_and_os, snr_db, waterfall_total_secs,
 };
+
+/// Screen width below which the layout switches to a mobile-friendly mode:
+/// the messages side panel collapses into a toggleable bottom drawer.
+const MOBILE_BREAKPOINT: f32 = 600.0;
 
 pub(crate) struct GuiApp {
     shared:          Arc<SimShared>,
@@ -39,6 +43,8 @@ pub(crate) struct GuiApp {
     uhd_freq_mhz:    f64,
     uhd_rx_gain_db:  f64,
     uhd_tx_gain_db:  f64,
+    /// Whether the messages bottom drawer is open (mobile layout only).
+    msg_drawer_open: bool,
 }
 
 impl GuiApp {
@@ -125,6 +131,7 @@ impl GuiApp {
             uhd_freq_mhz:   915.0,
             uhd_rx_gain_db: 40.0,
             uhd_tx_gain_db: 40.0,
+            msg_drawer_open: false,
         }
     }
 
@@ -191,6 +198,53 @@ fn newline_if_needed(ui: &mut egui::Ui, needed: f32) {
     }
 }
 
+fn show_messages_panel(
+    ui: &mut egui::Ui,
+    stats: &Stats,
+    log: &std::collections::VecDeque<LogEntry>,
+    shared: &SimShared,
+) {
+    let accounted = stats.rx_count + stats.rx_lost;
+    let per = if accounted > 0 {
+        100.0 * stats.rx_lost as f32 / accounted as f32
+    } else { 0.0 };
+    ui.horizontal(|ui| {
+        ui.label(format!("{}/{} rx", stats.rx_count, stats.tx_count));
+        if stats.rx_lost > 0 {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 60, 60),
+                format!("{} lost", stats.rx_lost),
+            );
+        }
+        ui.label(format!("PER {:.0}%", per));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("↺ Reset").clicked() {
+                *shared.stats.lock().unwrap() = Stats::default();
+                shared.log.lock().unwrap().clear();
+                shared.clear_buf.store(true, Ordering::Relaxed);
+            }
+        });
+    });
+    ui.separator();
+
+    egui::ScrollArea::vertical()
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for entry in log {
+                ui.horizontal(|ui| {
+                    let (dot, color) = if entry.ok {
+                        ("●", egui::Color32::from_rgb(80, 200, 80))
+                    } else {
+                        ("●", egui::Color32::from_rgb(220, 60, 60))
+                    };
+                    ui.colored_label(color, dot);
+                    ui.label(&entry.payload);
+                });
+            }
+        });
+}
+
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.thread_started {
@@ -210,6 +264,9 @@ impl eframe::App for GuiApp {
             #[cfg(target_arch = "wasm32")]
             wasm_bindgen_futures::spawn_local(sim_loop(shared, Some(ctx2)));
         }
+
+        let screen_w = ctx.input(|i| i.screen_rect().width());
+        let is_mobile = screen_w < MOBILE_BREAKPOINT;
 
         let running = self.shared.running.load(Ordering::Relaxed);
         let stats   = self.shared.stats.lock().unwrap().clone();
@@ -430,57 +487,49 @@ impl eframe::App for GuiApp {
                         "⚠ TX slow",
                     ).on_hover_text("TX modulator can't keep up with the requested interval — gaps in the IQ stream");
                 }
+
+                if is_mobile {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if self.msg_drawer_open {
+                            "✉ ▼".to_string()
+                        } else if !log.is_empty() {
+                            format!("✉ ({})", log.len())
+                        } else {
+                            "✉".to_string()
+                        };
+                        if ui.button(label).clicked() {
+                            self.msg_drawer_open = !self.msg_drawer_open;
+                        }
+                    });
+                }
             });
         });
 
-        egui::SidePanel::right("msg_log")
-            .exact_width(260.0)
-            .show(ctx, |ui| {
-                ui.heading("Messages");
-                ui.separator();
-
-                // ── Stats + reset ─────────────────────────────────────────────
-                let accounted = stats.rx_count + stats.rx_lost;
-                let per = if accounted > 0 {
-                    100.0 * stats.rx_lost as f32 / accounted as f32
-                } else { 0.0 };
-                ui.horizontal(|ui| {
-                    ui.label(format!("{}/{} rx", stats.rx_count, stats.tx_count));
-                    if stats.rx_lost > 0 {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 60, 60),
-                            format!("{} lost", stats.rx_lost),
-                        );
-                    }
-                    ui.label(format!("PER {:.0}%", per));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("↺ Reset").clicked() {
-                            *self.shared.stats.lock().unwrap() = Stats::default();
-                            self.shared.log.lock().unwrap().clear();
-                            self.shared.clear_buf.store(true, Ordering::Relaxed);
-                                            }
-                    });
+        // ── Messages panel — side panel on desktop, bottom drawer on mobile ──
+        if !is_mobile {
+            egui::SidePanel::right("msg_log")
+                .exact_width(260.0)
+                .show(ctx, |ui| {
+                    show_messages_panel(ui, &stats, &log, &self.shared);
                 });
-                ui.separator();
-
-                // ── Scrolling message log ─────────────────────────────────────
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for entry in &log {
-                            ui.horizontal(|ui| {
-                                let (dot, color) = if entry.ok {
-                                    ("●", egui::Color32::from_rgb(80, 200, 80))
-                                } else {
-                                    ("●", egui::Color32::from_rgb(220, 60, 60))
-                                };
-                                ui.colored_label(color, dot);
-                                ui.label(&entry.payload);
-                            });
-                        }
+        } else if self.msg_drawer_open {
+            egui::TopBottomPanel::bottom("msg_drawer")
+                .resizable(true)
+                .default_height(240.0)
+                .min_height(120.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Messages");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").clicked() {
+                                self.msg_drawer_open = false;
+                            }
+                        });
                     });
-            });
+                    ui.separator();
+                    show_messages_panel(ui, &stats, &log, &self.shared);
+                });
+        }
 
         // Update x-axis label mode: MHz when UHD is active, bins otherwise.
         #[cfg(feature = "uhd")]
