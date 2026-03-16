@@ -63,7 +63,7 @@ fn bins_close(a: usize, b: usize, n: usize) -> bool {
 pub fn frame_sync(
     samples:      &[Complex<f32>],
     sf:           u8,
-    _sync_word:   u8,
+    sync_word:    u8,
     preamble_len: u16,
     os_factor:    u32,
 ) -> FrameSyncResult {
@@ -85,7 +85,7 @@ pub fn frame_sync(
     let mut cos_sum = 0.0_f64;
 
     let mut w = 0usize;
-    while w + sps <= samples.len() {
+    'search: while w + sps <= samples.len() {
         let bin = symbol_bin(&mut buf, &samples[w..w + sps], os_factor as usize, &downchirp, fft.as_ref());
 
         if consec == 0 {
@@ -145,8 +145,33 @@ pub fn frame_sync(
                 //   →  sync_start = end_w + d - sps.
                 //
                 // Payload follows: 2 sync symbols + 2.25 SFD symbols = 4.25 sps.
-                let sync_start = if 2 * d < sps { end_w + d } else { end_w + d - sps };
+                let sync_start    = if 2 * d < sps { end_w + d } else { end_w + d - sps };
                 let payload_start = sync_start + 4 * sps + sps / 4;
+
+                // Validate the two sync-word chirps when we have enough samples.
+                // sw0 / sw1 are the upchirp IDs encoded from each nibble of the
+                // sync word byte: sw0 = high_nibble << 3, sw1 = low_nibble << 3.
+                if sync_start + 2 * sps <= samples.len() {
+                    let exp_sw0 = ((sync_word as usize & 0xF0) >> 4) << 3;
+                    let exp_sw1 =  (sync_word as usize & 0x0F)       << 3;
+                    let det_sw0 = symbol_bin(
+                        &mut buf, &samples[sync_start..sync_start + sps],
+                        os_factor as usize, &downchirp, fft.as_ref(),
+                    );
+                    let det_sw1 = symbol_bin(
+                        &mut buf, &samples[sync_start + sps..sync_start + 2 * sps],
+                        os_factor as usize, &downchirp, fft.as_ref(),
+                    );
+                    if !bins_close(det_sw0, exp_sw0, n) || !bins_close(det_sw1, exp_sw1, n) {
+                        // Sync word mismatch — different network.  Skip past
+                        // the preamble end and restart the search.
+                        consec  = 0;
+                        sin_sum = 0.0;
+                        cos_sum = 0.0;
+                        w       = end_w;
+                        continue 'search;
+                    }
+                }
 
                 if payload_start + sps <= samples.len() {
                     let len = ((samples.len() - payload_start) / sps) * sps;

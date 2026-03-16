@@ -39,11 +39,12 @@
 // ─── Shared constants ─────────────────────────────────────────────────────────
 
 pub(crate) const SR_OPTIONS_KHZ:        &[u32]  = &[125, 250, 500, 1000, 2000, 4000];
-pub(crate) const BW_OPTIONS_KHZ:        &[u32]  = &[125, 250, 500, 1000];
+pub(crate) const BW_OPTIONS_KHZ:        &[f32]  = &[62.5, 125.0, 250.0, 500.0, 1000.0];
 
 pub(crate) const DEFAULT_SF:            u8      = 7;
 pub(crate) const DEFAULT_SAMP_RATE_KHZ: u32     = 1000;
-pub(crate) const DEFAULT_BW_KHZ:        u32     = 250;
+pub(crate) const DEFAULT_BW_KHZ:        f32     = 250.0;
+pub(crate) const DEFAULT_SYNC_WORD:     u8      = 0x12;
 pub(crate) const DEFAULT_FFT_SIZE:      usize   = 1024;
 pub(crate) const DEFAULT_SIGNAL_DB:     f32     = -20.0;
 pub(crate) const DEFAULT_NOISE_DB:      f32     = -60.0;
@@ -51,13 +52,20 @@ pub(crate) const DEFAULT_INTERVAL_MS:   u64     = 500;
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
-pub(crate) fn khz_label(v: u32) -> String {
-    if v >= 1000 { format!("{}M", v / 1000) } else { format!("{}k", v) }
+pub(crate) fn khz_label(v: f32) -> String {
+    if v >= 1000.0 {
+        format!("{}M", (v / 1000.0) as u32)
+    } else if v.fract() == 0.0 {
+        format!("{}k", v as u32)
+    } else {
+        format!("{v}k")
+    }
 }
 
-pub(crate) fn effective_sr_and_os(samp_rate_khz: u32, bw_khz: u32) -> (u32, u32) {
-    let sr = samp_rate_khz.max(bw_khz);
-    (sr, sr / bw_khz)
+pub(crate) fn effective_sr_and_os(samp_rate_khz: u32, bw_khz: f32) -> (u32, u32) {
+    let sr = (samp_rate_khz as f32).max(bw_khz).round() as u32;
+    let os = ((sr as f32) / bw_khz).round() as u32;
+    (sr, os.max(1))
 }
 
 /// Convert amplitude dBFS to linear amplitude.

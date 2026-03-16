@@ -14,6 +14,7 @@ pub(crate) struct SimShared {
     pub signal_db:      Mutex<f32>,
     pub noise_db:       Mutex<f32>,
     pub interval_ms:    Mutex<u64>,
+    pub sync_word:      Mutex<u8>,
     pub spectrum_plot:  Arc<SpectrumPlot>,
     pub waterfall_plot: Arc<WaterfallPlot>,
     pub stats:          Mutex<Stats>,

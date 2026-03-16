@@ -10,7 +10,7 @@ use super::shared::{LogEntry, SimShared, Stats};
 use super::sim::sim_loop;
 use super::{
     DEFAULT_SF, DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FFT_SIZE,
-    DEFAULT_SIGNAL_DB, DEFAULT_NOISE_DB, DEFAULT_INTERVAL_MS,
+    DEFAULT_SIGNAL_DB, DEFAULT_NOISE_DB, DEFAULT_INTERVAL_MS, DEFAULT_SYNC_WORD,
     SR_OPTIONS_KHZ, BW_OPTIONS_KHZ,
     khz_label, effective_sr_and_os, snr_db, waterfall_total_secs,
 };
@@ -36,8 +36,9 @@ pub(crate) struct GuiApp {
     interval_ms:     u64,
     sf:              u8,
     samp_rate_khz:   u32,
-    bw_khz:          u32,
+    bw_khz:          f32,
     fft_size:        usize,
+    sync_word:       u8,
     // ── UHD hardware device UI state ──────────────────────────────────────────
     uhd_args:        String,
     uhd_freq_mhz:    f64,
@@ -96,6 +97,7 @@ impl GuiApp {
             signal_db:      Mutex::new(signal_db),
             noise_db:       Mutex::new(noise_db),
             interval_ms:    Mutex::new(DEFAULT_INTERVAL_MS),
+            sync_word:      Mutex::new(DEFAULT_SYNC_WORD),
             spectrum_plot,
             waterfall_plot,
             stats:          Mutex::new(Stats::default()),
@@ -133,6 +135,7 @@ impl GuiApp {
             uhd_freq_mhz:   915.0,
             uhd_rx_gain_db: 40.0,
             uhd_tx_gain_db: 40.0,
+            sync_word:       DEFAULT_SYNC_WORD,
             msg_drawer_open: false,
             menu_open: false,
         }
@@ -146,9 +149,11 @@ impl GuiApp {
         self.signal_db     = DEFAULT_SIGNAL_DB;
         self.noise_db      = DEFAULT_NOISE_DB;
         self.interval_ms   = DEFAULT_INTERVAL_MS;
+        self.sync_word     = DEFAULT_SYNC_WORD;
         *self.shared.signal_db.lock().unwrap()   = self.signal_db;
         *self.shared.noise_db.lock().unwrap()    = self.noise_db;
         *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
+        *self.shared.sync_word.lock().unwrap()   = self.sync_word;
         self.rebuild_plots();
     }
 
@@ -352,7 +357,7 @@ impl eframe::App for GuiApp {
                                 ui.label("SR:");
                                 ui.horizontal_wrapped(|ui| {
                                     for &sr in SR_OPTIONS_KHZ {
-                                        if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
+                                        if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr as f32)).clicked()
                                             && self.samp_rate_khz != sr
                                         { self.samp_rate_khz = sr; changed = true; }
                                     }
@@ -383,6 +388,20 @@ impl eframe::App for GuiApp {
                                         if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
                                             && self.fft_size != sz
                                         { self.fft_size = sz; changed = true; }
+                                    }
+                                });
+                                ui.end_row();
+
+                                // Sync word
+                                ui.label("Sync:");
+                                ui.horizontal(|ui| {
+                                    for (label, val) in [("0x12", 0x12u8), ("0x2B", 0x2B)] {
+                                        if ui.selectable_label(self.sync_word == val, label).clicked()
+                                            && self.sync_word != val
+                                        {
+                                            self.sync_word = val;
+                                            *self.shared.sync_word.lock().unwrap() = val;
+                                        }
                                     }
                                 });
                                 ui.end_row();
@@ -529,7 +548,7 @@ impl eframe::App for GuiApp {
                     ui.horizontal(|ui| {
                         ui.label("SR:");
                         for &sr in SR_OPTIONS_KHZ {
-                            if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
+                            if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr as f32)).clicked()
                                 && self.samp_rate_khz != sr
                             { self.samp_rate_khz = sr; changed = true; }
                         }
@@ -566,6 +585,21 @@ impl eframe::App for GuiApp {
                     });
 
                     if changed { self.rebuild_plots(); }
+
+                    ui.separator();
+
+                    newline_if_needed(ui, 140.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Sync:");
+                        for (label, val) in [("0x12", 0x12u8), ("0x2B", 0x2B)] {
+                            if ui.selectable_label(self.sync_word == val, label).clicked()
+                                && self.sync_word != val
+                            {
+                                self.sync_word = val;
+                                *self.shared.sync_word.lock().unwrap() = val;
+                            }
+                        }
+                    });
 
                     ui.separator();
 

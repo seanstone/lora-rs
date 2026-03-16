@@ -115,14 +115,14 @@ pub(crate) async fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>)
     let mut active_uhd_args: String = String::new();
 
     macro_rules! dispatch_tx {
-        ($sf:expr, $os:expr) => {{
+        ($sf:expr, $os:expr, $sw:expr) => {{
             let text = payloads[payload_idx % payloads.len()];
             payload_idx += 1;
             let mut payload = Vec::with_capacity(2 + text.len());
             payload.extend_from_slice(&seq.to_le_bytes());
             payload.extend_from_slice(text);
             seq = seq.wrapping_add(1);
-            let _ = tx_job_send.send(TxJob { sf: $sf, cr: 4, os_factor: $os, payload, tx_gen });
+            let _ = tx_job_send.send(TxJob { sf: $sf, cr: 4, os_factor: $os, sync_word: $sw, payload, tx_gen });
             jobs_in_flight += 1;
         }};
     }
@@ -222,6 +222,7 @@ pub(crate) async fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>)
         let signal_db     = *shared.signal_db.lock().unwrap();
         let noise_db      = *shared.noise_db.lock().unwrap();
         let interval_ms   = *shared.interval_ms.lock().unwrap();
+        let sync_word     = *shared.sync_word.lock().unwrap();
 
         let signal_amp  = db_to_amp(signal_db);
         let noise_sigma = db_to_amp(noise_db) / std::f32::consts::SQRT_2;
@@ -279,7 +280,7 @@ pub(crate) async fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>)
         shared.tx_starved.store(starved, Ordering::Relaxed);
 
         while tx_queue.len() + jobs_in_flight < TX_PIPELINE_DEPTH {
-            dispatch_tx!(sf, os_factor);
+            dispatch_tx!(sf, os_factor, sync_word);
         }
 
         let n     = samples_per_tick as usize;
@@ -287,7 +288,7 @@ pub(crate) async fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>)
         produced_samples += mixed.len() as u64;
 
         let _ = rx_send.send(RxJob {
-            sf, cr: 4, os_factor,
+            sf, cr: 4, os_factor, sync_word,
             samples: mixed.clone(),
             tx_gen,
         });

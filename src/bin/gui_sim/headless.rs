@@ -9,7 +9,7 @@ use super::shared::{SimShared, Stats};
 use super::sim::sim_loop;
 use super::{
     DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FFT_SIZE,
-    DEFAULT_SIGNAL_DB, DEFAULT_INTERVAL_MS,
+    DEFAULT_SIGNAL_DB, DEFAULT_INTERVAL_MS, DEFAULT_SYNC_WORD,
     effective_sr_and_os,
 };
 
@@ -47,6 +47,7 @@ pub(crate) fn run_headless(sf: u8, snr_db_val: f32, packet_count: usize) {
         noise_db:       Mutex::new(noise_db),
         interval_ms:    Mutex::new(std::env::var("INTERVAL_MS").ok()
             .and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL_MS)),
+        sync_word:      Mutex::new(DEFAULT_SYNC_WORD),
         spectrum_plot,
         waterfall_plot,
         stats:          Mutex::new(Stats::default()),
