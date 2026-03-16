@@ -167,11 +167,21 @@ impl UhdDevice {
 
 impl Drop for UhdDevice {
     fn drop(&mut self) {
+        // 1. Signal threads to stop and idle the RX thread so it doesn't call
+        //    uhd_glue_recv while we tear down the device.
         self.running.store(false, Ordering::Relaxed);
-        unsafe { ffi::uhd_glue_stop_rx(); }
-        if let Some(h) = self.tx_thread.take() { let _ = h.join(); }
+        self.streaming.store(false, Ordering::Relaxed);
+
+        // 2. Join both worker threads — RX idles immediately (streaming=false),
+        //    TX finishes its current uhd_glue_send (≤0.1 s timeout) and exits.
         if let Some(h) = self.rx_thread.take() { let _ = h.join(); }
-        std::thread::spawn(|| unsafe { ffi::uhd_glue_close(); });
+        if let Some(h) = self.tx_thread.take() { let _ = h.join(); }
+
+        // 3. No concurrent FFI calls now — safe to stop RX and close the device.
+        unsafe {
+            ffi::uhd_glue_stop_rx();
+            ffi::uhd_glue_close();
+        }
     }
 }
 
