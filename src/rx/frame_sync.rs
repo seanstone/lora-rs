@@ -133,8 +133,8 @@ pub fn frame_sync(
                         break;
                     }
                 }
-                eprintln!("[sync] pre_start={preamble_start} w={w} end_w={end_w} upchirps={} d={d} buf={}",
-                          (end_w - preamble_start) / sps, samples.len());
+                // eprintln!("[sync] pre_start={preamble_start} w={w} end_w={end_w} upchirps={} d={d} buf={}",
+                //           (end_w - preamble_start) / sps, samples.len());
                 // end_w = first non-upchirp window in the sps-stride scan.
                 //
                 // When d < sps/2: the sync word begins inside window [end_w..end_w+sps]
