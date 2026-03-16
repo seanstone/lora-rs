@@ -10,7 +10,7 @@ use super::shared::{LogEntry, SimShared, Stats};
 use super::sim::sim_loop;
 use super::{
     DEFAULT_SF, DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ, DEFAULT_FFT_SIZE,
-    DEFAULT_SIGNAL_DB, DEFAULT_NOISE_DB, DEFAULT_INTERVAL_MS, DEFAULT_SYNC_WORD,
+    DEFAULT_SIGNAL_DB, DEFAULT_NOISE_DB, DEFAULT_INTERVAL_MS, DEFAULT_SYNC_WORD, DEFAULT_PREAMBLE_LEN,
     SR_OPTIONS_KHZ, BW_OPTIONS_KHZ,
     khz_label, effective_sr_and_os, snr_db, waterfall_total_secs,
 };
@@ -39,6 +39,7 @@ pub(crate) struct GuiApp {
     bw_khz:          f32,
     fft_size:        usize,
     sync_word:       u8,
+    preamble_len:    u16,
     // ── UHD hardware device UI state ──────────────────────────────────────────
     uhd_args:        String,
     uhd_freq_mhz:    f64,
@@ -98,6 +99,7 @@ impl GuiApp {
             noise_db:       Mutex::new(noise_db),
             interval_ms:    Mutex::new(DEFAULT_INTERVAL_MS),
             sync_word:      Mutex::new(DEFAULT_SYNC_WORD),
+            preamble_len:   Mutex::new(DEFAULT_PREAMBLE_LEN),
             spectrum_plot,
             waterfall_plot,
             stats:          Mutex::new(Stats::default()),
@@ -136,6 +138,7 @@ impl GuiApp {
             uhd_rx_gain_db: 40.0,
             uhd_tx_gain_db: 40.0,
             sync_word:       DEFAULT_SYNC_WORD,
+            preamble_len:    DEFAULT_PREAMBLE_LEN,
             msg_drawer_open: false,
             menu_open: false,
         }
@@ -150,10 +153,12 @@ impl GuiApp {
         self.noise_db      = DEFAULT_NOISE_DB;
         self.interval_ms   = DEFAULT_INTERVAL_MS;
         self.sync_word     = DEFAULT_SYNC_WORD;
+        self.preamble_len  = DEFAULT_PREAMBLE_LEN;
         *self.shared.signal_db.lock().unwrap()   = self.signal_db;
         *self.shared.noise_db.lock().unwrap()    = self.noise_db;
         *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
         *self.shared.sync_word.lock().unwrap()   = self.sync_word;
+        *self.shared.preamble_len.lock().unwrap() = self.preamble_len;
         self.rebuild_plots();
     }
 
@@ -406,6 +411,20 @@ impl eframe::App for GuiApp {
                                 });
                                 ui.end_row();
 
+                                // Preamble length
+                                ui.label("Preamble:");
+                                ui.horizontal(|ui| {
+                                    for (label, val) in [("8", 8u16), ("16", 16)] {
+                                        if ui.selectable_label(self.preamble_len == val, label).clicked()
+                                            && self.preamble_len != val
+                                        {
+                                            self.preamble_len = val;
+                                            *self.shared.preamble_len.lock().unwrap() = val;
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+
                                 // Interval
                                 ui.label("Interval:");
                                 let mut interval_f = self.interval_ms as f32;
@@ -597,6 +616,21 @@ impl eframe::App for GuiApp {
                             {
                                 self.sync_word = val;
                                 *self.shared.sync_word.lock().unwrap() = val;
+                            }
+                        }
+                    });
+
+                    ui.separator();
+
+                    newline_if_needed(ui, 120.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Pre:");
+                        for (label, val) in [("8", 8u16), ("16", 16)] {
+                            if ui.selectable_label(self.preamble_len == val, label).clicked()
+                                && self.preamble_len != val
+                            {
+                                self.preamble_len = val;
+                                *self.shared.preamble_len.lock().unwrap() = val;
                             }
                         }
                     });

@@ -12,10 +12,11 @@ use super::shared::{SimShared, LogEntry, MAX_LOG_ENTRIES};
 // ─── LoRa demodulator ─────────────────────────────────────────────────────────
 
 pub(crate) struct Rx {
-    pub sf:        u8,
-    pub cr:        u8,
-    pub os_factor: u32,
-    pub sync_word: u8,
+    pub sf:           u8,
+    pub cr:           u8,
+    pub os_factor:    u32,
+    pub sync_word:    u8,
+    pub preamble_len: u16,
 }
 
 pub(crate) enum DecodeResult {
@@ -28,14 +29,14 @@ pub(crate) enum DecodeResult {
 }
 
 impl Rx {
-    pub fn new(sf: u8, cr: u8, os_factor: u32, sync_word: u8) -> Self {
-        Self { sf, cr, os_factor, sync_word }
+    pub fn new(sf: u8, cr: u8, os_factor: u32, sync_word: u8, preamble_len: u16) -> Self {
+        Self { sf, cr, os_factor, sync_word, preamble_len }
     }
 
     /// Full decode from raw IQ (frame sync + demod + decode).
     #[allow(dead_code)]
     pub fn decode(&self, iq: &[Complex<f32>]) -> Option<Vec<u8>> {
-        let sync = frame_sync(iq, self.sf, self.sync_word, 8, self.os_factor);
+        let sync = frame_sync(iq, self.sf, self.sync_word, self.preamble_len, self.os_factor);
         if !sync.found { return None; }
         match self.decode_payload(&sync.symbols) {
             DecodeResult::Ok { payload, .. } => Some(payload),
@@ -103,12 +104,13 @@ impl Rx {
 
 /// Chunk of mixed IQ samples from the channel.
 pub(crate) struct RxJob {
-    pub sf:        u8,
-    pub cr:        u8,
-    pub os_factor: u32,
-    pub sync_word: u8,
-    pub samples:   Vec<Complex<f32>>,
-    pub tx_gen:    u64,
+    pub sf:           u8,
+    pub cr:           u8,
+    pub os_factor:    u32,
+    pub sync_word:    u8,
+    pub preamble_len: u16,
+    pub samples:      Vec<Complex<f32>>,
+    pub tx_gen:       u64,
 }
 
 /// Cap on the internal RX buffer to prevent unbounded growth at very low SNR.
@@ -125,7 +127,7 @@ const MAX_RX_BUFFER: usize = 1 << 22; // ~4 M samples, ~32 MB
 /// - **Failed**: drain to `payload_start` (skip the false/corrupt preamble),
 ///   let the next scan skip through the garbled payload.
 pub(crate) async fn rx_worker(mut jobs: tokio::sync::mpsc::UnboundedReceiver<RxJob>, shared: Arc<SimShared>) {
-    let mut rx       = Rx::new(7, 4, 4, 0x12);
+    let mut rx       = Rx::new(7, 4, 4, 0x12, 8);
     let mut buffer:  Vec<Complex<f32>> = Vec::new();
     let mut next_seq: u16 = 0;
     let mut rx_gen:  u64 = 0;
@@ -136,8 +138,10 @@ pub(crate) async fn rx_worker(mut jobs: tokio::sync::mpsc::UnboundedReceiver<RxJ
 
     while let Some(job) = jobs.recv().await {
         // Re-create decoder on settings change.
-        if job.sf != rx.sf || job.os_factor != rx.os_factor || job.sync_word != rx.sync_word {
-            rx = Rx::new(job.sf, job.cr, job.os_factor, job.sync_word);
+        if job.sf != rx.sf || job.os_factor != rx.os_factor
+            || job.sync_word != rx.sync_word || job.preamble_len != rx.preamble_len
+        {
+            rx = Rx::new(job.sf, job.cr, job.os_factor, job.sync_word, job.preamble_len);
             buffer.clear();
             next_seq = 0;
         }
@@ -167,7 +171,7 @@ pub(crate) async fn rx_worker(mut jobs: tokio::sync::mpsc::UnboundedReceiver<RxJ
         loop {
             if buffer.len() < sps { break; }
 
-            let sync = frame_sync(&buffer, rx.sf, rx.sync_word, 8, rx.os_factor);
+            let sync = frame_sync(&buffer, rx.sf, rx.sync_word, rx.preamble_len, rx.os_factor);
 
             if !sync.found {
                 // No sync found — drain the safely-scanned portion.

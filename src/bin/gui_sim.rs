@@ -45,6 +45,7 @@ pub(crate) const DEFAULT_SF:            u8      = 7;
 pub(crate) const DEFAULT_SAMP_RATE_KHZ: u32     = 1000;
 pub(crate) const DEFAULT_BW_KHZ:        f32     = 250.0;
 pub(crate) const DEFAULT_SYNC_WORD:     u8      = 0x12;
+pub(crate) const DEFAULT_PREAMBLE_LEN:  u16     = 8;
 pub(crate) const DEFAULT_FFT_SIZE:      usize   = 1024;
 pub(crate) const DEFAULT_SIGNAL_DB:     f32     = -20.0;
 pub(crate) const DEFAULT_NOISE_DB:      f32     = -60.0;

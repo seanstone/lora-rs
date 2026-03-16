@@ -8,15 +8,16 @@ use rustfft::num_complex::Complex;
 // ─── LoRa modulator ───────────────────────────────────────────────────────────
 
 pub(crate) struct Tx {
-    pub sf:        u8,
-    pub cr:        u8,
-    pub os_factor: u32,
-    pub sync_word: u8,
+    pub sf:           u8,
+    pub cr:           u8,
+    pub os_factor:    u32,
+    pub sync_word:    u8,
+    pub preamble_len: u16,
 }
 
 impl Tx {
-    pub fn new(sf: u8, cr: u8, os_factor: u32, sync_word: u8) -> Self {
-        Self { sf, cr, os_factor, sync_word }
+    pub fn new(sf: u8, cr: u8, os_factor: u32, sync_word: u8, preamble_len: u16) -> Self {
+        Self { sf, cr, os_factor, sync_word, preamble_len }
     }
 
     /// Produce clean (noise-free, unit-amplitude) LoRa IQ samples.
@@ -28,7 +29,7 @@ impl Tx {
         let codewords = hamming_enc(&padded, self.cr, self.sf);
         let symbols   = interleave(&codewords, self.cr, self.sf, false);
         let chirps    = gray_demap(&symbols, self.sf);
-        modulate(&chirps, self.sf, self.sync_word, 8, self.os_factor)
+        modulate(&chirps, self.sf, self.sync_word, self.preamble_len, self.os_factor)
     }
 }
 
@@ -46,12 +47,13 @@ fn pad_nibbles(nibbles: &[u8], sf: u8, ldro: bool) -> Vec<u8> {
 
 /// TX modulation request. AWGN and gain are applied by the Channel, not here.
 pub(crate) struct TxJob {
-    pub sf:        u8,
-    pub cr:        u8,
-    pub os_factor: u32,
-    pub sync_word: u8,
-    pub payload:   Vec<u8>,
-    pub tx_gen:    u64,
+    pub sf:           u8,
+    pub cr:           u8,
+    pub os_factor:    u32,
+    pub sync_word:    u8,
+    pub preamble_len: u16,
+    pub payload:      Vec<u8>,
+    pub tx_gen:       u64,
 }
 
 /// Clean (noise-free, unit-amplitude) modulated packet.
@@ -67,10 +69,12 @@ pub(crate) async fn tx_worker(
     mut jobs: tokio::sync::mpsc::UnboundedReceiver<TxJob>,
     results:  tokio::sync::mpsc::UnboundedSender<TxResult>,
 ) {
-    let mut tx = Tx::new(7, 4, 4, 0x12);
+    let mut tx = Tx::new(7, 4, 4, 0x12, 8);
     while let Some(job) = jobs.recv().await {
-        if job.sf != tx.sf || job.os_factor != tx.os_factor || job.sync_word != tx.sync_word {
-            tx = Tx::new(job.sf, job.cr, job.os_factor, job.sync_word);
+        if job.sf != tx.sf || job.os_factor != tx.os_factor
+            || job.sync_word != tx.sync_word || job.preamble_len != tx.preamble_len
+        {
+            tx = Tx::new(job.sf, job.cr, job.os_factor, job.sync_word, job.preamble_len);
         }
         let clean = tx.modulate(&job.payload);
         let _ = results.send(TxResult { payload: job.payload, clean, tx_gen: job.tx_gen });
