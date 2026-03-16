@@ -94,6 +94,28 @@ impl Rx {
         }
     }
 
+    /// Streaming decode: find and decode one frame, returning the payload and
+    /// the total number of input samples consumed (safe to `drain(..consumed)`
+    /// from a streaming buffer).
+    ///
+    /// Returns `None` when no complete frame is found — `consumed` in that case
+    /// is available via the lower-level `frame_sync` API if the caller needs to
+    /// trim scanned-but-frameless samples.
+    pub fn decode_streaming(&self, iq: &[Complex<f32>]) -> Option<(Vec<u8>, usize)> {
+        let sync = frame_sync(iq, self.sf, self.sync_word, self.preamble_len, self.os_factor);
+        if !sync.found { return None; }
+        match self.decode_payload(&sync.symbols) {
+            DecodeResult::Ok { payload, samples_used: _ } => {
+                // sync.consumed covers preamble+sync+header symbols that
+                // frame_sync extracted; samples_used is the additional payload
+                // portion.  Total to drain = sync.consumed (which already
+                // includes everything up to the end of the extracted symbols).
+                Some((payload, sync.consumed))
+            }
+            _ => None,
+        }
+    }
+
     /// Decode from already-extracted payload symbols (post frame-sync).
     ///
     /// Returns `Incomplete` when the header parses but there are not yet
