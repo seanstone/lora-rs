@@ -14,7 +14,7 @@ use super::tx::{TxJob, TxResult, tx_worker};
 use super::db_to_amp;
 
 #[cfg(feature = "uhd")]
-use super::uhd_device::UhdDevice;
+use lora::uhd::UhdDevice;
 
 fn make_driver(shared: &SimShared) -> Box<dyn Driver> {
     let noise_sigma = db_to_amp(*shared.noise_db.lock().unwrap()) / std::f32::consts::SQRT_2;

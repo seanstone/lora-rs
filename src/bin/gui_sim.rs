@@ -25,8 +25,7 @@
 #[path = "gui_sim/driver.rs"]   mod driver;
 #[path = "gui_sim/tx.rs"]       mod tx;
 #[path = "gui_sim/channel.rs"]  mod channel;
-#[cfg(feature = "uhd")]
-#[path = "gui_sim/uhd_device.rs"] mod uhd_device;
+// UhdDevice is now in lora::uhd (library module).
 #[path = "gui_sim/rx.rs"]       mod rx;
 #[path = "gui_sim/display.rs"]  mod display;
 #[path = "gui_sim/sim.rs"]      mod sim;
