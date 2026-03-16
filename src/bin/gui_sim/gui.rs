@@ -45,6 +45,8 @@ pub(crate) struct GuiApp {
     uhd_tx_gain_db:  f64,
     /// Whether the messages bottom drawer is open (mobile layout only).
     msg_drawer_open: bool,
+    /// Whether the settings drawer is open (mobile layout only).
+    menu_open: bool,
 }
 
 impl GuiApp {
@@ -132,6 +134,7 @@ impl GuiApp {
             uhd_rx_gain_db: 40.0,
             uhd_tx_gain_db: 40.0,
             msg_drawer_open: false,
+            menu_open: false,
         }
     }
 
@@ -272,238 +275,441 @@ impl eframe::App for GuiApp {
         let stats   = self.shared.stats.lock().unwrap().clone();
         let log     = self.shared.log.lock().unwrap().clone();
 
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            // ── Row 1: signal parameters ──────────────────────────────────────
-            ui.horizontal_wrapped(|ui| {
-                if ui.button(if running { "⏸ Pause" } else { "▶ Run" }).clicked() {
-                    self.shared.running.store(!running, Ordering::Relaxed);
-                }
+        // ── Compute shared state used in both mobile and desktop layouts ──────
+        #[cfg(feature = "uhd")]
+        let sim_mode = !self.shared.use_uhd.load(Ordering::Relaxed);
+        #[cfg(not(feature = "uhd"))]
+        let sim_mode = true;
 
-                ui.separator();
+        let lag_ms     = f32::from_bits(self.shared.buf_lag_ms  .load(Ordering::Relaxed));
+        let overflow   = self.shared.buf_overflow .load(Ordering::Relaxed);
+        let underflow  = self.shared.buf_underflow.load(Ordering::Relaxed);
+        let tx_starved = self.shared.tx_starved   .load(Ordering::Relaxed);
 
-                let mut changed = false;
-
-                newline_if_needed(ui, 230.0);
+        if is_mobile {
+            // ── Mobile: compact toolbar ───────────────────────────────────────
+            egui::TopBottomPanel::top("controls").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("SF:");
-                    for s in [7u8, 8, 9, 10, 11, 12] {
-                        if ui.selectable_label(self.sf == s, format!("{s}")).clicked()
-                            && self.sf != s
-                        { self.sf = s; changed = true; }
+                    if ui.button(if running { "⏸" } else { "▶" }).clicked() {
+                        self.shared.running.store(!running, Ordering::Relaxed);
                     }
-                });
-
-                ui.separator();
-
-                newline_if_needed(ui, 270.0);
-                ui.horizontal(|ui| {
-                    ui.label("SR:");
-                    for &sr in SR_OPTIONS_KHZ {
-                        if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
-                            && self.samp_rate_khz != sr
-                        { self.samp_rate_khz = sr; changed = true; }
+                    let menu_label = if self.menu_open { "✕" } else { "☰" };
+                    if ui.button(menu_label).clicked() {
+                        self.menu_open = !self.menu_open;
                     }
-                });
-
-                ui.separator();
-
-                newline_if_needed(ui, 250.0);
-                ui.horizontal(|ui| {
-                    ui.label("BW:");
-                    for &bw in BW_OPTIONS_KHZ {
-                        if ui.selectable_label(self.bw_khz == bw, khz_label(bw)).clicked()
-                            && self.bw_khz != bw
-                        { self.bw_khz = bw; changed = true; }
-                    }
-                    let (eff_sr, os) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
-                    ui.label(if eff_sr != self.samp_rate_khz {
-                        format!("×{os}↑")
-                    } else {
-                        format!("×{os}")
-                    });
-                });
-
-                ui.separator();
-
-                newline_if_needed(ui, 250.0);
-                ui.horizontal(|ui| {
-                    ui.label("FFT:");
-                    for &sz in &[1024usize, 2048, 4096, 8192] {
-                        if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
-                            && self.fft_size != sz
-                        { self.fft_size = sz; changed = true; }
-                    }
-                });
-
-                if changed { self.rebuild_plots(); }
-
-                ui.separator();
-
-                newline_if_needed(ui, 220.0);
-                ui.horizontal(|ui| {
-                    ui.label("Interval:");
-                    let h = ui.spacing().interact_size.y;
-                    let mut interval_f = self.interval_ms as f32;
-                    if ui.add_sized([120.0, h], Slider::new(&mut interval_f, 0.0..=5000.0)
-                        .suffix(" ms").step_by(50.0)).changed()
-                    {
-                        self.interval_ms = interval_f as u64;
-                        *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
-                    }
-                });
-
-                ui.separator();
-
-                if ui.button("⟳ Defaults").clicked() {
-                    self.restore_defaults();
-                }
-            });
-
-            // ── Row 2: driver + gains ─────────────────────────────────────────
-            ui.horizontal_wrapped(|ui| {
-                #[cfg(feature = "uhd")]
-                let sim_mode = !self.shared.use_uhd.load(Ordering::Relaxed);
-                #[cfg(not(feature = "uhd"))]
-                let sim_mode = true;
-
-                let h = ui.spacing().interact_size.y;
-
-                // Driver selector (UHD feature only)
-                #[cfg(feature = "uhd")]
-                {
-                    let use_uhd = !sim_mode;
-                    if ui.selectable_label(sim_mode, "Sim").clicked() && use_uhd {
-                        self.shared.use_uhd.store(false, Ordering::Relaxed);
-                        self.shared.rebuild_driver.store(true, Ordering::Relaxed);
-                        *self.shared.stats.lock().unwrap() = Stats::default();
-                        self.shared.log.lock().unwrap().clear();
-                    }
-                    if ui.selectable_label(use_uhd, "UHD").clicked() && sim_mode {
-                        self.shared.use_uhd.store(true, Ordering::Relaxed);
-                        self.shared.rebuild_driver.store(true, Ordering::Relaxed);
-                        *self.shared.stats.lock().unwrap() = Stats::default();
-                        self.shared.log.lock().unwrap().clear();
-                    }
-
-                    if !sim_mode {
-                        ui.separator();
-                        let mut uhd_changed = false;
-                        ui.label("Args:");
-                        if ui.add_sized([120.0, h], egui::TextEdit::singleline(&mut self.uhd_args)
-                            .hint_text("addr=… or empty")).lost_focus()
-                        {
-                            uhd_changed = true;
-                        }
-                        ui.separator();
-                        ui.label("Freq:");
-                        if ui.add_sized([100.0, h], egui::DragValue::new(&mut self.uhd_freq_mhz)
-                            .speed(0.1).suffix(" MHz").range(1.0..=6000.0)).changed()
-                        {
-                            uhd_changed = true;
-                        }
-                        if uhd_changed {
-                            *self.shared.uhd_args.lock().unwrap()    = self.uhd_args.clone();
-                            *self.shared.uhd_freq_hz.lock().unwrap() = self.uhd_freq_mhz * 1e6;
-                            self.shared.rebuild_driver.store(true, Ordering::Relaxed);
-                        }
-                    }
-
                     ui.separator();
-                }
-
-                // TX gain — sim: signal_db (dBFS);  UHD: uhd_tx_gain_db (dB)
-                newline_if_needed(ui, 190.0);
-                ui.horizontal(|ui| {
-                    ui.label("TX gain:");
-                    if sim_mode {
-                        if ui.add_sized([120.0, h], Slider::new(&mut self.signal_db, -40.0..=20.0)
-                            .suffix(" dBFS").step_by(1.0)).changed()
-                        {
-                            *self.shared.signal_db.lock().unwrap() = self.signal_db;
-                        }
+                    let (buf_color, buf_label) = if underflow {
+                        (egui::Color32::from_rgb(220, 160, 0), "⚠ UF")
+                    } else if overflow {
+                        (egui::Color32::from_rgb(220, 60, 60), "⚠ OF")
                     } else {
-                        #[cfg(feature = "uhd")]
-                        if ui.add_sized([120.0, h], Slider::new(&mut self.uhd_tx_gain_db, 0.0..=89.0)
-                            .suffix(" dB").step_by(0.5)).changed()
-                        {
-                            *self.shared.uhd_tx_gain_db.lock().unwrap() = self.uhd_tx_gain_db;
-                        }
+                        (egui::Color32::from_rgb(100, 180, 100), "●")
+                    };
+                    ui.colored_label(buf_color, buf_label);
+                    ui.label(format!("{lag_ms:.0} ms"));
+                    if tx_starved {
+                        ui.colored_label(egui::Color32::from_rgb(220, 160, 0), "TX!")
+                            .on_hover_text("TX modulator can't keep up — gaps in the IQ stream");
                     }
-                });
-
-                ui.separator();
-
-                // Noise (sim) / RX gain (UHD)
-                newline_if_needed(ui, 190.0);
-                ui.horizontal(|ui| {
-                    if sim_mode {
-                        ui.label("Noise:");
-                        if ui.add_sized([120.0, h], Slider::new(&mut self.noise_db, -80.0..=0.0)
-                            .suffix(" dBFS").step_by(1.0)).changed()
-                        {
-                            *self.shared.noise_db.lock().unwrap() = self.noise_db;
-                        }
-                    } else {
-                        #[cfg(feature = "uhd")]
-                        {
-                            ui.label("RX gain:");
-                            if ui.add_sized([120.0, h], Slider::new(&mut self.uhd_rx_gain_db, 0.0..=76.0)
-                                .suffix(" dB").step_by(0.5)).changed()
-                            {
-                                *self.shared.uhd_rx_gain_db.lock().unwrap() = self.uhd_rx_gain_db;
-                            }
-                        }
-                    }
-                });
-
-                // SNR readout — sim only
-                if sim_mode {
-                    newline_if_needed(ui, 110.0);
-                    ui.label(format!("SNR: {:.0} dB", snr_db(self.signal_db, self.noise_db)));
-                }
-            });
-
-            // ── Row 3: buffer status ──────────────────────────────────────────
-            ui.horizontal(|ui| {
-                let lag_ms    = f32::from_bits(self.shared.buf_lag_ms  .load(Ordering::Relaxed));
-                let overflow  = self.shared.buf_overflow .load(Ordering::Relaxed);
-                let underflow = self.shared.buf_underflow.load(Ordering::Relaxed);
-                let tx_starved = self.shared.tx_starved  .load(Ordering::Relaxed);
-
-                let (color, label) = if underflow {
-                    (egui::Color32::from_rgb(220, 160, 0), "⚠ UNDERFLOW")
-                } else if overflow {
-                    (egui::Color32::from_rgb(220, 60, 60),  "⚠ OVERFLOW")
-                } else {
-                    (egui::Color32::from_rgb(100, 180, 100), "●")
-                };
-                ui.colored_label(color, label);
-                ui.label(format!("buf {lag_ms:.0} ms"));
-
-                if tx_starved {
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 0),
-                        "⚠ TX slow",
-                    ).on_hover_text("TX modulator can't keep up with the requested interval — gaps in the IQ stream");
-                }
-
-                if is_mobile {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if self.msg_drawer_open {
-                            "✉ ▼".to_string()
+                        let msg_label = if self.msg_drawer_open {
+                            "✉▼".to_string()
                         } else if !log.is_empty() {
-                            format!("✉ ({})", log.len())
+                            format!("✉({})", log.len())
                         } else {
                             "✉".to_string()
                         };
-                        if ui.button(label).clicked() {
+                        if ui.button(msg_label).clicked() {
                             self.msg_drawer_open = !self.msg_drawer_open;
                         }
                     });
-                }
+                });
             });
-        });
+
+            // ── Mobile: settings drawer ───────────────────────────────────────
+            if self.menu_open {
+                egui::TopBottomPanel::top("settings_drawer").show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let h = ui.spacing().interact_size.y;
+                        let mut changed = false;
+
+                        egui::Grid::new("mobile_settings")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                // SF
+                                ui.label("SF:");
+                                ui.horizontal_wrapped(|ui| {
+                                    for s in [7u8, 8, 9, 10, 11, 12] {
+                                        if ui.selectable_label(self.sf == s, format!("{s}")).clicked()
+                                            && self.sf != s
+                                        { self.sf = s; changed = true; }
+                                    }
+                                });
+                                ui.end_row();
+
+                                // SR
+                                ui.label("SR:");
+                                ui.horizontal_wrapped(|ui| {
+                                    for &sr in SR_OPTIONS_KHZ {
+                                        if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
+                                            && self.samp_rate_khz != sr
+                                        { self.samp_rate_khz = sr; changed = true; }
+                                    }
+                                });
+                                ui.end_row();
+
+                                // BW
+                                ui.label("BW:");
+                                ui.horizontal_wrapped(|ui| {
+                                    for &bw in BW_OPTIONS_KHZ {
+                                        if ui.selectable_label(self.bw_khz == bw, khz_label(bw)).clicked()
+                                            && self.bw_khz != bw
+                                        { self.bw_khz = bw; changed = true; }
+                                    }
+                                    let (eff_sr, os) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
+                                    ui.label(if eff_sr != self.samp_rate_khz {
+                                        format!("×{os}↑")
+                                    } else {
+                                        format!("×{os}")
+                                    });
+                                });
+                                ui.end_row();
+
+                                // FFT
+                                ui.label("FFT:");
+                                ui.horizontal_wrapped(|ui| {
+                                    for &sz in &[1024usize, 2048, 4096, 8192] {
+                                        if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
+                                            && self.fft_size != sz
+                                        { self.fft_size = sz; changed = true; }
+                                    }
+                                });
+                                ui.end_row();
+
+                                // Interval
+                                ui.label("Interval:");
+                                let mut interval_f = self.interval_ms as f32;
+                                if ui.add_sized(
+                                    [ui.available_width(), h],
+                                    Slider::new(&mut interval_f, 0.0..=5000.0).suffix(" ms").step_by(50.0),
+                                ).changed() {
+                                    self.interval_ms = interval_f as u64;
+                                    *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
+                                }
+                                ui.end_row();
+
+                                // TX gain
+                                ui.label("TX gain:");
+                                if sim_mode {
+                                    if ui.add_sized(
+                                        [ui.available_width(), h],
+                                        Slider::new(&mut self.signal_db, -40.0..=20.0).suffix(" dBFS").step_by(1.0),
+                                    ).changed() {
+                                        *self.shared.signal_db.lock().unwrap() = self.signal_db;
+                                    }
+                                } else {
+                                    #[cfg(feature = "uhd")]
+                                    if ui.add_sized(
+                                        [ui.available_width(), h],
+                                        Slider::new(&mut self.uhd_tx_gain_db, 0.0..=89.0).suffix(" dB").step_by(0.5),
+                                    ).changed() {
+                                        *self.shared.uhd_tx_gain_db.lock().unwrap() = self.uhd_tx_gain_db;
+                                    }
+                                }
+                                ui.end_row();
+
+                                // Noise / RX gain
+                                if sim_mode {
+                                    ui.label("Noise:");
+                                    if ui.add_sized(
+                                        [ui.available_width(), h],
+                                        Slider::new(&mut self.noise_db, -80.0..=0.0).suffix(" dBFS").step_by(1.0),
+                                    ).changed() {
+                                        *self.shared.noise_db.lock().unwrap() = self.noise_db;
+                                    }
+                                } else {
+                                    #[cfg(feature = "uhd")]
+                                    {
+                                        ui.label("RX gain:");
+                                        if ui.add_sized(
+                                            [ui.available_width(), h],
+                                            Slider::new(&mut self.uhd_rx_gain_db, 0.0..=76.0).suffix(" dB").step_by(0.5),
+                                        ).changed() {
+                                            *self.shared.uhd_rx_gain_db.lock().unwrap() = self.uhd_rx_gain_db;
+                                        }
+                                    }
+                                }
+                                ui.end_row();
+
+                                // UHD-specific rows
+                                #[cfg(feature = "uhd")]
+                                if !sim_mode {
+                                    ui.label("Args:");
+                                    if ui.add_sized(
+                                        [ui.available_width(), h],
+                                        egui::TextEdit::singleline(&mut self.uhd_args).hint_text("addr=… or empty"),
+                                    ).lost_focus() {
+                                        *self.shared.uhd_args.lock().unwrap() = self.uhd_args.clone();
+                                        self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Freq:");
+                                    if ui.add_sized(
+                                        [ui.available_width(), h],
+                                        egui::DragValue::new(&mut self.uhd_freq_mhz).speed(0.1).suffix(" MHz").range(1.0..=6000.0),
+                                    ).changed() {
+                                        *self.shared.uhd_freq_hz.lock().unwrap() = self.uhd_freq_mhz * 1e6;
+                                        self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+
+                        if changed { self.rebuild_plots(); }
+
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            if sim_mode {
+                                ui.label(format!("SNR: {:.0} dB", snr_db(self.signal_db, self.noise_db)));
+                            }
+                            #[cfg(feature = "uhd")]
+                            {
+                                let use_uhd = !sim_mode;
+                                if ui.selectable_label(sim_mode, "Sim").clicked() && use_uhd {
+                                    self.shared.use_uhd.store(false, Ordering::Relaxed);
+                                    self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                                    *self.shared.stats.lock().unwrap() = Stats::default();
+                                    self.shared.log.lock().unwrap().clear();
+                                }
+                                if ui.selectable_label(use_uhd, "UHD").clicked() && sim_mode {
+                                    self.shared.use_uhd.store(true, Ordering::Relaxed);
+                                    self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                                    *self.shared.stats.lock().unwrap() = Stats::default();
+                                    self.shared.log.lock().unwrap().clear();
+                                }
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("⟳ Defaults").clicked() {
+                                    self.restore_defaults();
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                    });
+                });
+            }
+        } else {
+            // ── Desktop: existing multi-row controls panel ────────────────────
+            egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+                // ── Row 1: signal parameters ──────────────────────────────────
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(if running { "⏸ Pause" } else { "▶ Run" }).clicked() {
+                        self.shared.running.store(!running, Ordering::Relaxed);
+                    }
+
+                    ui.separator();
+
+                    let mut changed = false;
+
+                    newline_if_needed(ui, 230.0);
+                    ui.horizontal(|ui| {
+                        ui.label("SF:");
+                        for s in [7u8, 8, 9, 10, 11, 12] {
+                            if ui.selectable_label(self.sf == s, format!("{s}")).clicked()
+                                && self.sf != s
+                            { self.sf = s; changed = true; }
+                        }
+                    });
+
+                    ui.separator();
+
+                    newline_if_needed(ui, 270.0);
+                    ui.horizontal(|ui| {
+                        ui.label("SR:");
+                        for &sr in SR_OPTIONS_KHZ {
+                            if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
+                                && self.samp_rate_khz != sr
+                            { self.samp_rate_khz = sr; changed = true; }
+                        }
+                    });
+
+                    ui.separator();
+
+                    newline_if_needed(ui, 250.0);
+                    ui.horizontal(|ui| {
+                        ui.label("BW:");
+                        for &bw in BW_OPTIONS_KHZ {
+                            if ui.selectable_label(self.bw_khz == bw, khz_label(bw)).clicked()
+                                && self.bw_khz != bw
+                            { self.bw_khz = bw; changed = true; }
+                        }
+                        let (eff_sr, os) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
+                        ui.label(if eff_sr != self.samp_rate_khz {
+                            format!("×{os}↑")
+                        } else {
+                            format!("×{os}")
+                        });
+                    });
+
+                    ui.separator();
+
+                    newline_if_needed(ui, 250.0);
+                    ui.horizontal(|ui| {
+                        ui.label("FFT:");
+                        for &sz in &[1024usize, 2048, 4096, 8192] {
+                            if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
+                                && self.fft_size != sz
+                            { self.fft_size = sz; changed = true; }
+                        }
+                    });
+
+                    if changed { self.rebuild_plots(); }
+
+                    ui.separator();
+
+                    newline_if_needed(ui, 220.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Interval:");
+                        let h = ui.spacing().interact_size.y;
+                        let mut interval_f = self.interval_ms as f32;
+                        if ui.add_sized([120.0, h], Slider::new(&mut interval_f, 0.0..=5000.0)
+                            .suffix(" ms").step_by(50.0)).changed()
+                        {
+                            self.interval_ms = interval_f as u64;
+                            *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
+                        }
+                    });
+
+                    ui.separator();
+
+                    if ui.button("⟳ Defaults").clicked() {
+                        self.restore_defaults();
+                    }
+                });
+
+                // ── Row 2: driver + gains ─────────────────────────────────────
+                ui.horizontal_wrapped(|ui| {
+                    let h = ui.spacing().interact_size.y;
+
+                    // Driver selector (UHD feature only)
+                    #[cfg(feature = "uhd")]
+                    {
+                        let use_uhd = !sim_mode;
+                        if ui.selectable_label(sim_mode, "Sim").clicked() && use_uhd {
+                            self.shared.use_uhd.store(false, Ordering::Relaxed);
+                            self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                            *self.shared.stats.lock().unwrap() = Stats::default();
+                            self.shared.log.lock().unwrap().clear();
+                        }
+                        if ui.selectable_label(use_uhd, "UHD").clicked() && sim_mode {
+                            self.shared.use_uhd.store(true, Ordering::Relaxed);
+                            self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                            *self.shared.stats.lock().unwrap() = Stats::default();
+                            self.shared.log.lock().unwrap().clear();
+                        }
+
+                        if !sim_mode {
+                            ui.separator();
+                            let mut uhd_changed = false;
+                            ui.label("Args:");
+                            if ui.add_sized([120.0, h], egui::TextEdit::singleline(&mut self.uhd_args)
+                                .hint_text("addr=… or empty")).lost_focus()
+                            {
+                                uhd_changed = true;
+                            }
+                            ui.separator();
+                            ui.label("Freq:");
+                            if ui.add_sized([100.0, h], egui::DragValue::new(&mut self.uhd_freq_mhz)
+                                .speed(0.1).suffix(" MHz").range(1.0..=6000.0)).changed()
+                            {
+                                uhd_changed = true;
+                            }
+                            if uhd_changed {
+                                *self.shared.uhd_args.lock().unwrap()    = self.uhd_args.clone();
+                                *self.shared.uhd_freq_hz.lock().unwrap() = self.uhd_freq_mhz * 1e6;
+                                self.shared.rebuild_driver.store(true, Ordering::Relaxed);
+                            }
+                        }
+
+                        ui.separator();
+                    }
+
+                    // TX gain — sim: signal_db (dBFS);  UHD: uhd_tx_gain_db (dB)
+                    newline_if_needed(ui, 190.0);
+                    ui.horizontal(|ui| {
+                        ui.label("TX gain:");
+                        if sim_mode {
+                            if ui.add_sized([120.0, h], Slider::new(&mut self.signal_db, -40.0..=20.0)
+                                .suffix(" dBFS").step_by(1.0)).changed()
+                            {
+                                *self.shared.signal_db.lock().unwrap() = self.signal_db;
+                            }
+                        } else {
+                            #[cfg(feature = "uhd")]
+                            if ui.add_sized([120.0, h], Slider::new(&mut self.uhd_tx_gain_db, 0.0..=89.0)
+                                .suffix(" dB").step_by(0.5)).changed()
+                            {
+                                *self.shared.uhd_tx_gain_db.lock().unwrap() = self.uhd_tx_gain_db;
+                            }
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Noise (sim) / RX gain (UHD)
+                    newline_if_needed(ui, 190.0);
+                    ui.horizontal(|ui| {
+                        if sim_mode {
+                            ui.label("Noise:");
+                            if ui.add_sized([120.0, h], Slider::new(&mut self.noise_db, -80.0..=0.0)
+                                .suffix(" dBFS").step_by(1.0)).changed()
+                            {
+                                *self.shared.noise_db.lock().unwrap() = self.noise_db;
+                            }
+                        } else {
+                            #[cfg(feature = "uhd")]
+                            {
+                                ui.label("RX gain:");
+                                if ui.add_sized([120.0, h], Slider::new(&mut self.uhd_rx_gain_db, 0.0..=76.0)
+                                    .suffix(" dB").step_by(0.5)).changed()
+                                {
+                                    *self.shared.uhd_rx_gain_db.lock().unwrap() = self.uhd_rx_gain_db;
+                                }
+                            }
+                        }
+                    });
+
+                    // SNR readout — sim only
+                    if sim_mode {
+                        newline_if_needed(ui, 110.0);
+                        ui.label(format!("SNR: {:.0} dB", snr_db(self.signal_db, self.noise_db)));
+                    }
+                });
+
+                // ── Row 3: buffer status ──────────────────────────────────────
+                ui.horizontal(|ui| {
+                    let (color, label) = if underflow {
+                        (egui::Color32::from_rgb(220, 160, 0), "⚠ UNDERFLOW")
+                    } else if overflow {
+                        (egui::Color32::from_rgb(220, 60, 60),  "⚠ OVERFLOW")
+                    } else {
+                        (egui::Color32::from_rgb(100, 180, 100), "●")
+                    };
+                    ui.colored_label(color, label);
+                    ui.label(format!("buf {lag_ms:.0} ms"));
+
+                    if tx_starved {
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 160, 0),
+                            "⚠ TX slow",
+                        ).on_hover_text("TX modulator can't keep up with the requested interval — gaps in the IQ stream");
+                    }
+                });
+            });
+        }
 
         // ── Messages panel — side panel on desktop, bottom drawer on mobile ──
         if !is_mobile {
