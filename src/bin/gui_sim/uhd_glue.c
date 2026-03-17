@@ -219,3 +219,16 @@ size_t uhd_glue_send(const int16_t *buf, size_t n)
 
 size_t uhd_glue_rx_buf_size(void) { return g_rx_buf_size; }
 size_t uhd_glue_tx_buf_size(void) { return g_tx_buf_size; }
+
+/* Probe for any connected USRP device.  Returns 1 if found, 0 otherwise.
+ * Does NOT open the device — fast and non-destructive. */
+int uhd_glue_probe(void)
+{
+    uhd_string_vector_handle vec = NULL;
+    uhd_string_vector_make(&vec);
+    uhd_usrp_find("", &vec);
+    size_t n = 0;
+    uhd_string_vector_size(vec, &n);
+    uhd_string_vector_free(&vec);
+    return n > 0 ? 1 : 0;
+}

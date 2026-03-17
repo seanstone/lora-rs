@@ -45,7 +45,15 @@ mod ffi {
 
         pub fn uhd_glue_rx_buf_size() -> usize;
         pub fn uhd_glue_tx_buf_size() -> usize;
+
+        /// Probe for any connected USRP.  Returns 1 if found, 0 otherwise.
+        pub fn uhd_glue_probe() -> std::os::raw::c_int;
     }
+}
+
+/// Check if any USRP device is connected (fast, non-destructive probe).
+pub fn probe() -> bool {
+    unsafe { ffi::uhd_glue_probe() != 0 }
 }
 
 // ── UhdDevice ────────────────────────────────────────────────────────────────
