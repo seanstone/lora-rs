@@ -112,7 +112,7 @@ impl Chart {
             .custom_y_axes(self.y_axes())
             .show_grid(true)
             .allow_drag(false)
-            .allow_zoom(true)
+            .allow_zoom(false)
             .allow_scroll(false)
             .link_axis(self.link_axis.0, self.link_axis.1)
             .link_cursor(self.link_cursor.0, self.link_cursor.1)
