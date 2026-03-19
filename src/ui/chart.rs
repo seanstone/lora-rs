@@ -174,7 +174,7 @@ impl Chart {
         let (scroll, pointer_down, modifiers) = input;
         let bounds = plot_ui.plot_bounds();
 
-        if let Some(mut scroll) = scroll {
+        if let Some(mut scroll) = scroll.filter(|_| plot_ui.response().hovered()) {
             scroll = Vec2::splat(scroll.x + scroll.y);
             const ZOOM_SPEED: f32 = 2.0;
             let mut zoom = if modifiers.shift {
