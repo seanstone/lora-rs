@@ -214,11 +214,19 @@ pub fn frame_sync(
                 if payload_start + sps <= samples.len() {
                     let len = ((samples.len() - payload_start) / sps) * sps;
 
-                    // TODO: frequency correction disabled pending validation.
-                    // Return raw symbols; offset estimate is still reported.
+                    // Apply frequency correction: rotate each sample to
+                    // compensate for the estimated offset.
+                    let f_corr = -(offset_bins as f64) / (n as f64 * os_factor as f64);
+                    let mut corrected = samples[payload_start..payload_start + len].to_vec();
+                    for (i, s) in corrected.iter_mut().enumerate() {
+                        let phase = TAU * f_corr * i as f64;
+                        let (sin, cos) = phase.sin_cos();
+                        *s = *s * Complex::new(cos as f32, sin as f32);
+                    }
+
                     return FrameSyncResult {
                         found:    true,
-                        symbols:  samples[payload_start..payload_start + len].to_vec(),
+                        symbols:  corrected,
                         consumed: payload_start + len,
                         freq_offset_bins: offset_bins,
                     };
