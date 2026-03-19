@@ -66,6 +66,18 @@ pub enum DecodeResult {
     Incomplete,
     /// Header checksum or payload CRC failed — corruption.
     Failed,
+    /// Header decoded OK but payload CRC failed.  Contains the header info.
+    CrcFail { payload_len: u8, cr: u8, has_crc: bool },
+}
+
+/// Result of [`Rx::decode_streaming`].
+pub enum StreamDecodeResult {
+    /// Payload decoded and CRC verified.
+    Ok { payload: Vec<u8>, consumed: usize },
+    /// Header decoded but payload CRC failed.
+    CrcFail { payload_len: u8, cr: u8, has_crc: bool, consumed: usize },
+    /// No frame found in the buffer.
+    None,
 }
 
 // ── Rx ───────────────────────────────────────────────────────────────────────
@@ -101,18 +113,19 @@ impl Rx {
     /// Returns `None` when no complete frame is found — `consumed` in that case
     /// is available via the lower-level `frame_sync` API if the caller needs to
     /// trim scanned-but-frameless samples.
-    pub fn decode_streaming(&self, iq: &[Complex<f32>]) -> Option<(Vec<u8>, usize)> {
+    /// Result of [`decode_streaming`]: either a decoded payload, a CRC failure
+    /// with header info, or nothing found.
+    pub fn decode_streaming(&self, iq: &[Complex<f32>]) -> StreamDecodeResult {
         let sync = frame_sync(iq, self.sf, self.sync_word, self.preamble_len, self.os_factor);
-        if !sync.found { return None; }
+        if !sync.found { return StreamDecodeResult::None; }
         match self.decode_payload(&sync.symbols) {
             DecodeResult::Ok { payload, samples_used: _ } => {
-                // sync.consumed covers preamble+sync+header symbols that
-                // frame_sync extracted; samples_used is the additional payload
-                // portion.  Total to drain = sync.consumed (which already
-                // includes everything up to the end of the extracted symbols).
-                Some((payload, sync.consumed))
+                StreamDecodeResult::Ok { payload, consumed: sync.consumed }
             }
-            _ => None,
+            DecodeResult::CrcFail { payload_len, cr, has_crc } => {
+                StreamDecodeResult::CrcFail { payload_len, cr, has_crc, consumed: sync.consumed }
+            }
+            _ => StreamDecodeResult::None,
         }
     }
 
@@ -143,7 +156,13 @@ impl Rx {
         let payload     = dewhiten(pay_nibbles);
         if info.has_crc {
             let crc_nib = &info.payload_nibbles[2 * pay_len..2 * pay_len + 4];
-            if !verify_crc(&payload, crc_nib) { return DecodeResult::Failed; }
+            if !verify_crc(&payload, crc_nib) {
+                return DecodeResult::CrcFail {
+                    payload_len: info.payload_len,
+                    cr: info.cr,
+                    has_crc: info.has_crc,
+                };
+            }
         }
 
         let samples_used = self.payload_samples(pay_len, info.has_crc);
