@@ -89,7 +89,9 @@ pub fn frame_sync(
 ) -> FrameSyncResult {
     let n         = 1usize << sf;
     let sps       = n * os_factor as usize;
-    let n_up_req  = preamble_len as usize - 3;
+    // Require fewer consecutive preamble matches than the full preamble length
+    // to tolerate weak signals.  Minimum 4 to avoid false positives.
+    let n_up_req  = (preamble_len as usize).saturating_sub(5).max(4);
     let downchirp = make_downchirp(sf);
 
     let mut planner = FftPlanner::<f32>::new();
@@ -104,12 +106,11 @@ pub fn frame_sync(
     let mut sin_sum = 0.0_f64;
     let mut cos_sum = 0.0_f64;
 
-    // Preamble bin tolerance: ±1 for the initial preamble run.
-    // Sync word tolerance scales with SF to handle frequency offset:
-    // at SF11, a 2kHz offset at 250kHz BW → ~16 bins, but preamble bins
-    // all shift by the same amount.  Sync word bins are *absolute*, so we
-    // compare relative to the preamble's offset.
-    let sw_tol: usize = 2; // ±2 bins for sync word chirps (after offset compensation)
+    // Preamble tolerance: first 2 windows must match exactly, then ±2 bins
+    // to handle noise and minor frequency drift within a single packet.
+    let pre_tol: usize = 2;
+    // Sync word tolerance: ±3 bins to handle frequency offset between nodes.
+    let sw_tol: usize  = 3;
 
     let not_found = |consumed| FrameSyncResult {
         found: false, symbols: vec![], consumed, freq_offset_bins: 0.0,
@@ -127,7 +128,7 @@ pub fn frame_sync(
             sin_sum = angle.sin();
             cos_sum = angle.cos();
         } else if (consec == 1 && bin == preamble_bin)
-               || (consec >= 2 && bins_close(bin, preamble_bin, n)) {
+               || (consec >= 2 && bins_close_tol(bin, preamble_bin, n, pre_tol)) {
             consec += 1;
             let angle = TAU * bin as f64 / n as f64;
             sin_sum += angle.sin();
