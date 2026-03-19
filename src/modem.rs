@@ -76,6 +76,9 @@ pub enum StreamDecodeResult {
     Ok { payload: Vec<u8>, consumed: usize, freq_offset_bins: f64 },
     /// Header decoded but payload CRC failed.
     CrcFail { payload_len: u8, cr: u8, has_crc: bool, consumed: usize, freq_offset_bins: f64 },
+    /// Preamble found but decode failed (header invalid or incomplete).
+    /// Caller should drain `consumed` to skip past and avoid re-scanning.
+    DecodeFailed { consumed: usize },
     /// No frame found in the buffer.
     None,
 }
@@ -126,7 +129,8 @@ impl Rx {
             DecodeResult::CrcFail { payload_len, cr, has_crc } => {
                 StreamDecodeResult::CrcFail { payload_len, cr, has_crc, consumed: sync.consumed, freq_offset_bins: fob }
             }
-            _ => StreamDecodeResult::None,
+            DecodeResult::Failed => StreamDecodeResult::DecodeFailed { consumed: sync.consumed },
+            DecodeResult::Incomplete => StreamDecodeResult::None,
         }
     }
 
