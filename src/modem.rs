@@ -73,9 +73,9 @@ pub enum DecodeResult {
 /// Result of [`Rx::decode_streaming`].
 pub enum StreamDecodeResult {
     /// Payload decoded and CRC verified.
-    Ok { payload: Vec<u8>, consumed: usize },
+    Ok { payload: Vec<u8>, consumed: usize, freq_offset_bins: f64 },
     /// Header decoded but payload CRC failed.
-    CrcFail { payload_len: u8, cr: u8, has_crc: bool, consumed: usize },
+    CrcFail { payload_len: u8, cr: u8, has_crc: bool, consumed: usize, freq_offset_bins: f64 },
     /// No frame found in the buffer.
     None,
 }
@@ -118,12 +118,13 @@ impl Rx {
     pub fn decode_streaming(&self, iq: &[Complex<f32>]) -> StreamDecodeResult {
         let sync = frame_sync(iq, self.sf, self.sync_word, self.preamble_len, self.os_factor);
         if !sync.found { return StreamDecodeResult::None; }
+        let fob = sync.freq_offset_bins;
         match self.decode_payload(&sync.symbols) {
             DecodeResult::Ok { payload, samples_used: _ } => {
-                StreamDecodeResult::Ok { payload, consumed: sync.consumed }
+                StreamDecodeResult::Ok { payload, consumed: sync.consumed, freq_offset_bins: fob }
             }
             DecodeResult::CrcFail { payload_len, cr, has_crc } => {
-                StreamDecodeResult::CrcFail { payload_len, cr, has_crc, consumed: sync.consumed }
+                StreamDecodeResult::CrcFail { payload_len, cr, has_crc, consumed: sync.consumed, freq_offset_bins: fob }
             }
             _ => StreamDecodeResult::None,
         }

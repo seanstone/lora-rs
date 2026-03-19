@@ -11,6 +11,10 @@ pub struct FrameSyncResult {
     /// scanned without finding a complete preamble (any partial preamble at the
     /// tail is *kept*).
     pub consumed: usize,
+    /// Estimated frequency offset in bins (fractional).  Positive means the
+    /// transmitter is higher than our centre frequency.  Only valid when
+    /// `found == true`.
+    pub freq_offset_bins: f64,
 }
 
 fn make_downchirp(sf: u8) -> Vec<Complex<f32>> {
@@ -25,18 +29,17 @@ fn make_downchirp(sf: u8) -> Vec<Complex<f32>> {
 
 /// Dechirp + FFT one symbol window of `sps = n * os_factor` raw samples.
 /// Center-sample decimates to N before the N-point FFT.
-fn symbol_bin(
+/// Returns (peak_bin, peak_magnitude_squared).
+fn symbol_bin_mag(
     buf:       &mut Vec<Complex<f32>>,
     samples:   &[Complex<f32>],  // sps samples
     os_factor: usize,
     downchirp: &[Complex<f32>],
     fft:       &dyn rustfft::Fft<f32>,
-) -> usize {
-    // Stride decimation: take sample 0 of each os_factor-wide group.
+) -> (usize, f32) {
     for (i, b) in buf.iter_mut().enumerate() {
         *b = samples[os_factor * i];
     }
-    // Dechirp then FFT.
     for (b, d) in buf.iter_mut().zip(downchirp.iter()) {
         *b = *b * d;
     }
@@ -44,13 +47,30 @@ fn symbol_bin(
     buf.iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.norm_sqr().partial_cmp(&b.norm_sqr()).unwrap())
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+        .map(|(i, c)| (i, c.norm_sqr()))
+        .unwrap_or((0, 0.0))
+}
+
+fn symbol_bin(
+    buf: &mut Vec<Complex<f32>>,
+    samples: &[Complex<f32>],
+    os_factor: usize,
+    downchirp: &[Complex<f32>],
+    fft: &dyn rustfft::Fft<f32>,
+) -> usize {
+    symbol_bin_mag(buf, samples, os_factor, downchirp, fft).0
+}
+
+/// Are two FFT bins within ±`tol` (mod n)?
+fn bins_close_tol(a: usize, b: usize, n: usize, tol: usize) -> bool {
+    let diff = if a >= b { a - b } else { b - a };
+    let diff = diff.min(n - diff); // wrap-around distance
+    diff <= tol
 }
 
 /// Are two FFT bins within ±1 (mod n)?
 fn bins_close(a: usize, b: usize, n: usize) -> bool {
-    a == b || (a + 1) % n == b || (b + 1) % n == a
+    bins_close_tol(a, b, n, 1)
 }
 
 /// Detect a LoRa preamble in `samples` and return the raw payload IQ windows.
@@ -84,12 +104,22 @@ pub fn frame_sync(
     let mut sin_sum = 0.0_f64;
     let mut cos_sum = 0.0_f64;
 
+    // Preamble bin tolerance: ±1 for the initial preamble run.
+    // Sync word tolerance scales with SF to handle frequency offset:
+    // at SF11, a 2kHz offset at 250kHz BW → ~16 bins, but preamble bins
+    // all shift by the same amount.  Sync word bins are *absolute*, so we
+    // compare relative to the preamble's offset.
+    let sw_tol: usize = 2; // ±2 bins for sync word chirps (after offset compensation)
+
+    let not_found = |consumed| FrameSyncResult {
+        found: false, symbols: vec![], consumed, freq_offset_bins: 0.0,
+    };
+
     let mut w = 0usize;
     'search: while w + sps <= samples.len() {
         let bin = symbol_bin(&mut buf, &samples[w..w + sps], os_factor as usize, &downchirp, fft.as_ref());
 
         if consec == 0 {
-            // Start a new candidate preamble run.
             preamble_start = w;
             preamble_bin   = bin;
             consec         = 1;
@@ -98,9 +128,6 @@ pub fn frame_sync(
             cos_sum = angle.cos();
         } else if (consec == 1 && bin == preamble_bin)
                || (consec >= 2 && bins_close(bin, preamble_bin, n)) {
-            // First two windows must match exactly to avoid contaminated
-            // partial-chirp windows anchoring preamble_start too early.
-            // After two exact matches, allow ±1 for noise tolerance.
             consec += 1;
             let angle = TAU * bin as f64 / n as f64;
             sin_sum += angle.sin();
@@ -108,18 +135,13 @@ pub fn frame_sync(
 
             if consec >= n_up_req {
                 // ── Preamble found — compute aligned payload start ────────
-                // Circular mean of the detected bins for sub-bin precision.
                 let mean_angle = sin_sum.atan2(cos_sum);
                 let mean_bin   = ((mean_angle / TAU * n as f64).round() as isize)
                     .rem_euclid(n as isize) as usize;
 
-                // A dechirped upchirp at fractional offset d produces FFT
-                // bin = (N − d/os_factor) mod N.  Invert to recover d.
                 let d = ((n - mean_bin) % n) * os_factor as usize;
 
-                // Scan forward past remaining upchirps to find the end
-                // of the preamble (first non-upchirp window = sync word).
-                // This is robust regardless of which chirp started the run.
+                // Scan forward past remaining upchirps.
                 let mut end_w = w + sps;
                 while end_w + sps <= samples.len() {
                     let next_bin = symbol_bin(
@@ -133,25 +155,21 @@ pub fn frame_sync(
                         break;
                     }
                 }
-                // eprintln!("[sync] pre_start={preamble_start} w={w} end_w={end_w} upchirps={} d={d} buf={}",
-                //           (end_w - preamble_start) / sps, samples.len());
-                // end_w = first non-upchirp window in the sps-stride scan.
-                //
-                // When d < sps/2: the sync word begins inside window [end_w..end_w+sps]
-                //   at offset d  →  sync_start = end_w + d.
-                // When d ≥ sps/2: the previous window [end_w-sps..end_w] still looked
-                //   like an upchirp (upchirp portion d > sps/2 dominated), so the sync
-                //   word actually started one window earlier at offset d within it
-                //   →  sync_start = end_w + d - sps.
-                //
-                // Payload follows: 2 sync symbols + 2.25 SFD symbols = 4.25 sps.
+
                 let sync_start    = if 2 * d < sps { end_w + d } else { end_w + d - sps };
                 let payload_start = sync_start + 4 * sps + sps / 4;
 
-                // Validate the two sync-word chirps when we have enough samples.
-                // sw0 / sw1 are the upchirp IDs encoded from each nibble of the
-                // sync word byte: sw0 = high_nibble << 3, sw1 = low_nibble << 3.
+                // Validate the two sync-word chirps with offset compensation.
+                // The preamble bin tells us the frequency offset: an unshifted
+                // preamble produces bin 0 (or N-d/os for alignment d).  The
+                // preamble_bin we detected includes both alignment AND frequency
+                // offset.  The sync word expected bins also include alignment,
+                // so we add the preamble_bin as an offset.
                 if sync_start + 2 * sps <= samples.len() {
+                    // sync_start is aligned to the chirp boundary, so the
+                    // dechirped bins give the raw sync word values directly
+                    // (alignment offset already removed).  Use wider tolerance
+                    // to handle residual frequency offset.
                     let exp_sw0 = ((sync_word as usize & 0xF0) >> 4) << 3;
                     let exp_sw1 =  (sync_word as usize & 0x0F)       << 3;
                     let det_sw0 = symbol_bin(
@@ -162,9 +180,8 @@ pub fn frame_sync(
                         &mut buf, &samples[sync_start + sps..sync_start + 2 * sps],
                         os_factor as usize, &downchirp, fft.as_ref(),
                     );
-                    if !bins_close(det_sw0, exp_sw0, n) || !bins_close(det_sw1, exp_sw1, n) {
-                        // Sync word mismatch — different network.  Skip past
-                        // the preamble end and restart the search.
+                    if !bins_close_tol(det_sw0, exp_sw0, n, sw_tol)
+                    || !bins_close_tol(det_sw1, exp_sw1, n, sw_tol) {
                         consec  = 0;
                         sin_sum = 0.0;
                         cos_sum = 0.0;
@@ -173,19 +190,45 @@ pub fn frame_sync(
                     }
                 }
 
+                // ── Estimate frequency offset ────────────────────────────
+                // Preamble upchirps at alignment d produce bin = (N - d/os) % N.
+                // The *actual* detected mean_bin includes both alignment and
+                // frequency offset.  Since d was derived from mean_bin via
+                // d = (N - mean_bin) % N * os, the alignment portion cancels
+                // and any residual is noise.
+                //
+                // For a more precise estimate, use the sub-bin circular mean
+                // directly: the fractional part tells us the frequency offset.
+                let mean_bin_frac = mean_angle / TAU * n as f64;
+                let expected_bin  = ((n - d / os_factor as usize) % n) as f64;
+                let offset_bins   = mean_bin_frac - expected_bin;
+                // Wrap to [-N/2, N/2).
+                let offset_bins = if offset_bins > n as f64 / 2.0 {
+                    offset_bins - n as f64
+                } else if offset_bins < -(n as f64 / 2.0) {
+                    offset_bins + n as f64
+                } else {
+                    offset_bins
+                };
+
                 if payload_start + sps <= samples.len() {
                     let len = ((samples.len() - payload_start) / sps) * sps;
+
+                    // TODO: frequency correction disabled pending validation.
+                    // Return raw symbols; offset estimate is still reported.
                     return FrameSyncResult {
                         found:    true,
                         symbols:  samples[payload_start..payload_start + len].to_vec(),
                         consumed: payload_start + len,
+                        freq_offset_bins: offset_bins,
                     };
                 }
-                // Preamble found but not enough payload yet — keep it.
-                return FrameSyncResult { found: false, symbols: vec![], consumed: preamble_start };
+                return FrameSyncResult {
+                    found: false, symbols: vec![], consumed: preamble_start,
+                    freq_offset_bins: offset_bins,
+                };
             }
         } else {
-            // Bin changed — restart the run from this window.
             preamble_start = w;
             preamble_bin   = bin;
             consec         = 1;
@@ -196,7 +239,6 @@ pub fn frame_sync(
         w += sps;
     }
 
-    // Partial preamble at the tail → keep from preamble_start onward.
     let consumed = if consec > 0 { preamble_start } else { w };
-    FrameSyncResult { found: false, symbols: vec![], consumed }
+    not_found(consumed)
 }

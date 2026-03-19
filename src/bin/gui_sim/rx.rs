@@ -113,7 +113,7 @@ pub(crate) async fn rx_worker(mut jobs: tokio::sync::mpsc::UnboundedReceiver<RxJ
 
                 DecodeResult::Incomplete => { break; }
 
-                DecodeResult::Failed => {
+                DecodeResult::Failed | DecodeResult::CrcFail { .. } => {
                     let mut log = shared.log.lock().unwrap();
                     log.push_back(LogEntry { ok: false, payload: "CRC FAIL".into() });
                     if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
