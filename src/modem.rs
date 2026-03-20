@@ -87,21 +87,36 @@ pub enum StreamDecodeResult {
 
 /// LoRa demodulator: finds and decodes packets from a stream of IQ samples.
 pub struct Rx {
-    pub sf:           u8,
-    pub cr:           u8,
-    pub os_factor:    u32,
-    pub sync_word:    u8,
-    pub preamble_len: u16,
+    pub sf:             u8,
+    pub cr:             u8,
+    pub os_factor:      u32,
+    pub sync_word:      u8,
+    pub preamble_len:   u16,
+    /// Center frequency in Hz (0 = skip SFO compensation, e.g. simulation).
+    pub center_freq_hz: f64,
+    /// Bandwidth in Hz.
+    pub bw_hz:          f64,
 }
 
 impl Rx {
     pub fn new(sf: u8, cr: u8, os_factor: u32, sync_word: u8, preamble_len: u16) -> Self {
-        Self { sf, cr, os_factor, sync_word, preamble_len }
+        Self { sf, cr, os_factor, sync_word, preamble_len, center_freq_hz: 0.0, bw_hz: 0.0 }
+    }
+
+    /// Create an Rx with center frequency and bandwidth for SFO compensation.
+    pub fn new_with_freq(
+        sf: u8, cr: u8, os_factor: u32, sync_word: u8, preamble_len: u16,
+        center_freq_hz: f64, bw_hz: f64,
+    ) -> Self {
+        Self { sf, cr, os_factor, sync_word, preamble_len, center_freq_hz, bw_hz }
     }
 
     /// Convenience: run frame sync + decode on a complete IQ buffer.
     pub fn decode(&self, iq: &[Complex<f32>]) -> Option<Vec<u8>> {
-        let sync = frame_sync(iq, self.sf, self.sync_word, self.preamble_len, self.os_factor);
+        let sync = frame_sync(
+            iq, self.sf, self.sync_word, self.preamble_len, self.os_factor,
+            self.center_freq_hz, self.bw_hz,
+        );
         if !sync.found { return None; }
         match self.decode_payload(&sync.symbols) {
             DecodeResult::Ok { payload, .. } => Some(payload),
@@ -119,7 +134,10 @@ impl Rx {
     /// Result of [`decode_streaming`]: either a decoded payload, a CRC failure
     /// with header info, or nothing found.
     pub fn decode_streaming(&self, iq: &[Complex<f32>]) -> StreamDecodeResult {
-        let sync = frame_sync(iq, self.sf, self.sync_word, self.preamble_len, self.os_factor);
+        let sync = frame_sync(
+            iq, self.sf, self.sync_word, self.preamble_len, self.os_factor,
+            self.center_freq_hz, self.bw_hz,
+        );
         if !sync.found { return StreamDecodeResult::None; }
         let fob = sync.freq_offset_bins;
         match self.decode_payload(&sync.symbols) {

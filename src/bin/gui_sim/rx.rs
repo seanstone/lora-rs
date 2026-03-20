@@ -60,7 +60,10 @@ pub(crate) async fn rx_worker(mut jobs: tokio::sync::mpsc::UnboundedReceiver<RxJ
         loop {
             if buffer.len() < sps { break; }
 
-            let sync = frame_sync(&buffer, rx.sf, rx.sync_word, rx.preamble_len, rx.os_factor);
+            let sync = frame_sync(
+                &buffer, rx.sf, rx.sync_word, rx.preamble_len, rx.os_factor,
+                rx.center_freq_hz, rx.bw_hz,
+            );
 
             if !sync.found {
                 if sync.consumed > 0 { buffer.drain(..sync.consumed); }

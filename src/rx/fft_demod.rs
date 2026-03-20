@@ -61,7 +61,7 @@ mod tests {
         let syms: Vec<u32> = (0..n_syms).map(|i| (i as u32 * 13 + 7) % n).collect();
 
         let iq   = modulate(&syms, sf, 0x12, preamble_len, os_factor);
-        let sync = frame_sync(&iq, sf, 0x12, preamble_len, os_factor);
+        let sync = frame_sync(&iq, sf, 0x12, preamble_len, os_factor, 0.0, 0.0);
         assert!(sync.found, "frame_sync failed sf={sf} pl={preamble_len} ns={n_syms} os={os_factor}");
 
         let recovered = fft_demod(&sync.symbols, sf, os_factor);
