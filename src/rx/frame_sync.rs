@@ -34,54 +34,43 @@ fn make_upchirp(sf: u8) -> Vec<Complex<f32>> {
 
 // ── DSP helpers ──────────────────────────────────────────────────────────────
 
-/// Dechirp + FFT one symbol window.  Writes result into `buf`.
 fn symbol_spectrum(
-    buf:       &mut [Complex<f32>],
-    samples:   &[Complex<f32>],
-    os_factor: usize,
-    ref_chirp: &[Complex<f32>],
-    fft:       &dyn rustfft::Fft<f32>,
+    buf: &mut [Complex<f32>], samples: &[Complex<f32>], os_factor: usize,
+    ref_chirp: &[Complex<f32>], fft: &dyn rustfft::Fft<f32>,
 ) {
-    let n = buf.len();
     for (i, b) in buf.iter_mut().enumerate() {
-        *b = samples[os_factor * i];
-    }
-    for (b, d) in buf.iter_mut().zip(ref_chirp.iter()) {
-        *b = *b * d;
+        *b = samples[os_factor * i] * ref_chirp[i];
     }
     fft.process(buf);
-    // Normalise so magnitudes don't scale with N.
-    let inv = 1.0 / n as f32;
+    let inv = 1.0 / buf.len() as f32;
     for b in buf.iter_mut() { *b = *b * inv; }
 }
 
-/// Peak bin from FFT magnitude-squared.
-fn peak_bin(buf: &[Complex<f32>]) -> usize {
-    buf.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.norm_sqr().partial_cmp(&b.norm_sqr()).unwrap())
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
-/// Dechirp + FFT → peak bin.
 fn symbol_bin(
-    buf: &mut [Complex<f32>], samples: &[Complex<f32>],
-    os_factor: usize, ref_chirp: &[Complex<f32>], fft: &dyn rustfft::Fft<f32>,
+    buf: &mut [Complex<f32>], samples: &[Complex<f32>], os_factor: usize,
+    ref_chirp: &[Complex<f32>], fft: &dyn rustfft::Fft<f32>,
 ) -> usize {
     symbol_spectrum(buf, samples, os_factor, ref_chirp, fft);
-    peak_bin(buf)
+    buf.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.norm_sqr().partial_cmp(&b.norm_sqr()).unwrap())
+        .map(|(i, _)| i).unwrap_or(0)
 }
 
-/// Are two FFT bins within ±`tol` (mod n)?
-fn bins_close_tol(a: usize, b: usize, n: usize, tol: usize) -> bool {
+fn bins_close(a: usize, b: usize, n: usize, tol: usize) -> bool {
     let diff = if a >= b { a - b } else { b - a };
     diff.min(n - diff) <= tol
 }
 
-/// RCTSL sub-bin interpolation (Cui Yang, eq. 15).
-/// Given the three magnitude-squared values around the peak (Y_{-1}, Y_0, Y_1)
-/// and N (FFT size), returns the fractional bin offset in [-0.5, 0.5).
+fn most_frequent(vals: &[usize]) -> usize {
+    let mut best = 0;
+    let mut best_count = 0;
+    for &v in vals {
+        let count = vals.iter().filter(|&&x| x == v).count();
+        if count > best_count { best_count = count; best = v; }
+    }
+    best
+}
+
 fn rctsl_frac(y_m1: f64, y_0: f64, y_p1: f64, n: usize) -> f64 {
     let u  = 64.0 * n as f64 / 406.5506497;
     let v  = u * 2.4674;
@@ -89,17 +78,112 @@ fn rctsl_frac(y_m1: f64, y_0: f64, y_p1: f64, n: usize) -> f64 {
     wa * n as f64 / std::f64::consts::PI
 }
 
+// ── CFO/STO estimators ──────────────────────────────────────────────────────
+
+/// Bernier CFO_frac estimator: phase slope between consecutive symbols.
+fn estimate_cfo_frac_bernier(
+    samples: &[Complex<f32>], aligned_start: usize, n_symbols: usize,
+    sps: usize, n: usize, os_factor: usize,
+    downchirp: &[Complex<f32>], planner: &mut FftPlanner<f32>,
+) -> f64 {
+    if n_symbols < 2 { return 0.0; }
+    let fft = planner.plan_fft_forward(n);
+    let mut fft_results: Vec<Vec<Complex<f32>>> = Vec::with_capacity(n_symbols);
+    let mut peak_bins = Vec::with_capacity(n_symbols);
+    let mut peak_mags = Vec::with_capacity(n_symbols);
+
+    for s in 0..n_symbols {
+        let sym_start = aligned_start + s * sps;
+        if sym_start + (n - 1) * os_factor >= samples.len() { break; }
+        let mut buf = vec![Complex::new(0.0_f32, 0.0); n];
+        for i in 0..n { buf[i] = samples[sym_start + i * os_factor] * downchirp[i]; }
+        fft.process(&mut buf);
+        let (pk_bin, pk_mag) = buf.iter().enumerate()
+            .map(|(i, c)| (i, c.norm_sqr() as f64))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap_or((0, 0.0));
+        peak_bins.push(pk_bin);
+        peak_mags.push(pk_mag);
+        fft_results.push(buf);
+    }
+    if fft_results.len() < 2 { return 0.0; }
+
+    let strongest = peak_mags.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(0);
+    let idx_max = peak_bins[strongest];
+
+    let mut re_sum = 0.0_f64;
+    let mut im_sum = 0.0_f64;
+    for i in 0..fft_results.len() - 1 {
+        let a = fft_results[i][idx_max];
+        let b = fft_results[i + 1][idx_max];
+        re_sum += (a.re * b.re + a.im * b.im) as f64;
+        im_sum += (a.im * b.re - a.re * b.im) as f64;
+    }
+    -im_sum.atan2(re_sum) / TAU
+}
+
+/// STO_frac estimator: RCTSL on accumulated 2N-point FFT.
+fn estimate_sto_frac(
+    samples: &[Complex<f32>], aligned_start: usize, n_symbols: usize,
+    sps: usize, n: usize, os_factor: usize, cfo_frac: f64,
+    downchirp: &[Complex<f32>], planner: &mut FftPlanner<f32>,
+) -> f64 {
+    if n_symbols < 2 { return 0.0; }
+    let fft_len = 2 * n;
+    let fft_2n = planner.plan_fft_forward(fft_len);
+    let mut sto_acc = vec![0.0_f64; fft_len];
+    let mut sto_buf = vec![Complex::new(0.0_f32, 0.0); fft_len];
+
+    for s in 0..n_symbols {
+        let sym_start = aligned_start + s * sps;
+        if sym_start + (n - 1) * os_factor >= samples.len() { break; }
+        for i in 0..n {
+            let g = (s * n + i) as f64;
+            let ph = -TAU * cfo_frac / n as f64 * g;
+            let (sin, cos) = ph.sin_cos();
+            let rot = Complex::new(cos as f32, sin as f32);
+            sto_buf[i] = samples[sym_start + i * os_factor] * rot * downchirp[i];
+        }
+        for b in &mut sto_buf[n..] { *b = Complex::new(0.0, 0.0); }
+        fft_2n.process(&mut sto_buf);
+        for (a, b) in sto_acc.iter_mut().zip(sto_buf.iter()) { *a += b.norm_sqr() as f64; }
+        for b in &mut sto_buf { *b = Complex::new(0.0, 0.0); }
+    }
+
+    let k0 = sto_acc.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i).unwrap_or(0);
+    let y_m1 = sto_acc[(k0 + fft_len - 1) % fft_len];
+    let y_0  = sto_acc[k0];
+    let y_p1 = sto_acc[(k0 + 1) % fft_len];
+    let ka = rctsl_frac(y_m1, y_0, y_p1, n);
+    let k_residual = ((k0 as f64 + ka) / 2.0).rem_euclid(1.0);
+    if k_residual > 0.5 { k_residual - 1.0 } else { k_residual }
+}
+
+// ── Demod helper for SYNC phase ─────────────────────────────────────────────
+
+fn demod_sym(
+    buf: &mut [Complex<f32>], samples: &[Complex<f32>], pos: usize,
+    _sps: usize, os_factor: usize,
+    cfo_corr: &[Complex<f32>], ref_chirp: &[Complex<f32>],
+    fft: &dyn rustfft::Fft<f32>,
+) -> Option<usize> {
+    let n = buf.len();
+    if pos + (n - 1) * os_factor >= samples.len() { return None; }
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = samples[pos + os_factor * i] * cfo_corr[i] * ref_chirp[i];
+    }
+    fft.process(buf);
+    Some(buf.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.norm_sqr().partial_cmp(&b.norm_sqr()).unwrap())
+        .map(|(i, _)| i).unwrap_or(0))
+}
+
 // ── Main entry point ─────────────────────────────────────────────────────────
 
-/// Detect a LoRa preamble and return payload symbols with CFO/STO correction.
-///
-/// Algorithm (inspired by gr-lora_sdr / Tapparel et al.):
-/// 1. Non-coherent accumulation over `preamble_len` windows for detection
-/// 2. Per-window scan to find precise preamble boundaries (strong signals)
-/// 3. Multi-symbol CFO estimation with 2N-point FFT + RCTSL interpolation
-/// 4. STO estimation with accumulated 2N-point FFT + RCTSL
-/// 5. Sync word validation (strong signals) or CRC gatekeeper (weak)
-/// 6. CFO-corrected + STO-aligned payload extraction
+/// Hybrid LoRa preamble detector:
+///   Phase 1: Non-coherent accumulation (robust at low SNR)
+///   Phase 2: gr-lora_sdr-style SYNC walk (correct position tracking)
 pub fn frame_sync(
     samples:        &[Complex<f32>],
     sf:             u8,
@@ -117,21 +201,22 @@ pub fn frame_sync(
 
     let mut planner = FftPlanner::<f32>::new();
     let fft_n  = planner.plan_fft_forward(n);
-
     let mut buf = vec![Complex::new(0.0_f32, 0.0); n];
 
-    let sw_tol: usize             = 3;
-    let strong_threshold: f64     = 4.0;
-    let weak_decode_threshold: f64 = 6.0;
+    let detect_threshold: f64 = 6.0;
 
-    let not_found = |consumed| FrameSyncResult {
+    let not_found = |consumed: usize| FrameSyncResult {
         found: false, symbols: vec![], consumed, freq_offset_bins: 0.0,
     };
 
     let n_windows = samples.len().saturating_sub(sps - 1) / sps;
     if n_windows < pre_len + 5 { return not_found(0); }
 
-    // ── Phase 1: Non-coherent preamble accumulation ──────────────────────
+    // ════════════════════════════════════════════════════════════════════
+    // Phase 1: Non-coherent accumulation for preamble detection.
+    // Sums magnitude-squared spectra across pre_len windows.
+    // Robust at low per-symbol SNR because it averages over many symbols.
+    // ════════════════════════════════════════════════════════════════════
     let mut acc = vec![0.0_f64; n];
     let mut ring: Vec<Vec<f64>> = Vec::with_capacity(pre_len);
     for i in 0..pre_len {
@@ -152,323 +237,188 @@ pub fn frame_sync(
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).unwrap();
         let ratio = if mean > 0.0 { peak_val / mean } else { 0.0 };
 
-        if ratio > strong_threshold {
-            let preamble_bin = peak_idx;
-            let bin_tol = 4usize;
+        if ratio > detect_threshold {
+            // ════════════════════════════════════════════════════════════
+            // Phase 2: gr-lora_sdr-style SYNC walk.
+            //
+            // The accumulation window [w_start, w_start+pre_len) detected
+            // a preamble.  k_hat = peak_idx = (τ + ε) mod N.
+            //
+            // Walk forward from end_w through the remaining frame:
+            //   additional upchirps → sync words → downchirps → payload
+            // ════════════════════════════════════════════════════════════
+            let k_hat = peak_idx;
+            let end_w_samples = (w_start + pre_len) * sps;
 
-            // ── Phase 2: Find preamble boundaries ────────────────────────
-            let scan_start = w_start.saturating_sub(pre_len);
-            let scan_end   = (w_start + 2 * pre_len + 4).min(n_windows);
+            // Coarse alignment: adjust read position by (N - k_hat) * os.
+            let align_offset = ((n - k_hat) % n) * os_factor as usize;
+            let mut pos = end_w_samples - sps + align_offset;
 
-            let mut best_run_start = 0usize;
-            let mut best_run_len   = 0usize;
-            let mut cur_run_start  = scan_start;
-            let mut cur_run_len    = 0usize;
-            for wi in scan_start..scan_end {
-                let widx = wi * sps;
-                if widx + sps > samples.len() { break; }
-                let bin = symbol_bin(&mut buf, &samples[widx..widx + sps],
-                    os_factor as usize, &downchirp, fft_n.as_ref());
-                if bins_close_tol(bin, preamble_bin, n, bin_tol) {
-                    if cur_run_len == 0 { cur_run_start = wi; }
-                    cur_run_len += 1;
-                    if cur_run_len > best_run_len {
-                        best_run_len   = cur_run_len;
-                        best_run_start = cur_run_start;
-                    }
-                } else {
-                    cur_run_len = 0;
-                }
-            }
+            // CFO_frac estimation (Bernier) on aligned preamble.
+            let aligned_pre_start = w_start * sps + ((n - k_hat) % n) * os_factor as usize;
+            let up_symb_to_use = pre_len.saturating_sub(2);
 
-            let strong = best_run_len >= 3;
-            // Estimate CFO/STO even for weaker signals if we found ≥2 consecutive matching bins.
-            let up_symb_to_use = if best_run_len >= 2 { best_run_len.min(pre_len - 1) } else { 0 };
+            let cfo_frac = estimate_cfo_frac_bernier(
+                samples, aligned_pre_start, up_symb_to_use,
+                sps, n, os_factor as usize, &downchirp, &mut planner,
+            );
 
-            // Determine preamble region in sample space.
-            let (pre_sample_start, end_w) = if strong {
-                (best_run_start * sps, (best_run_start + best_run_len) * sps)
-            } else {
-                (w_start * sps, (w_start + pre_len) * sps)
-            };
+            let sto_frac = estimate_sto_frac(
+                samples, aligned_pre_start, up_symb_to_use,
+                sps, n, os_factor as usize, cfo_frac, &downchirp, &mut planner,
+            );
 
-            // ── Phase 3: CFO estimation (multi-symbol, 2N-point FFT) ─────
-            let cfo_frac = if up_symb_to_use >= 2 {
-                // Concatenate `up_symb_to_use` dechirped symbols, zero-pad to 2×, FFT.
-                let cat_len = up_symb_to_use * n;
-                let fft_len = 2 * cat_len;
-                let fft_2n  = planner.plan_fft_forward(fft_len);
-                let mut cfo_buf = vec![Complex::new(0.0_f32, 0.0); fft_len];
+            // CFO_frac correction vector for sync symbol demod.
+            let cfo_corr: Vec<Complex<f32>> = (0..n).map(|i| {
+                let phase = -TAU * cfo_frac / n as f64 * i as f64;
+                let (sin, cos) = phase.sin_cos();
+                Complex::new(cos as f32, sin as f32)
+            }).collect();
 
-                // Dechirp each preamble symbol (downsampled) and concatenate.
-                for s in 0..up_symb_to_use {
-                    let sym_start = pre_sample_start + s * sps;
-                    for i in 0..n {
-                        let sample = samples[sym_start + i * os_factor as usize];
-                        cfo_buf[s * n + i] = sample * downchirp[i];
-                    }
-                }
-                // Zero-padding already in place (vec initialized to 0).
-
-                fft_2n.process(&mut cfo_buf);
-
-                // Find peak and apply RCTSL.
-                let mag2: Vec<f64> = cfo_buf.iter().map(|c| c.norm_sqr() as f64).collect();
-                let k0 = mag2.iter().enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(i, _)| i).unwrap_or(0);
-
-                let y_m1 = mag2[(k0 + fft_len - 1) % fft_len];
-                let y_0  = mag2[k0];
-                let y_p1 = mag2[(k0 + 1) % fft_len];
-
-                let ka = rctsl_frac(y_m1, y_0, y_p1, n);
-                let k_residual = ((k0 as f64 + ka) / 2.0 / up_symb_to_use as f64).rem_euclid(1.0);
-                let cfo = if k_residual > 0.5 { k_residual - 1.0 } else { k_residual };
-
-                eprintln!("[sync] CFO estimate: {cfo:.4} bins ({:.1} Hz @ BW/N)",
-                    cfo * 250000.0 / n as f64);
-                cfo
-            } else {
-                0.0
-            };
-
-            // ── Phase 4: STO estimation (accumulated 2N-point FFT) ───────
-            let sto_frac = if up_symb_to_use >= 2 {
-                // Accumulate magnitude-squared of 2N-point FFT across symbols.
-                let fft_len = 2 * n;
-                let fft_2n  = planner.plan_fft_forward(fft_len);
-                let mut sto_acc = vec![0.0_f64; fft_len];
-                let mut sto_buf = vec![Complex::new(0.0_f32, 0.0); fft_len];
-
-                for s in 0..up_symb_to_use {
-                    let sym_start = pre_sample_start + s * sps;
-                    // Dechirp with CFO correction.
-                    for i in 0..n {
-                        let global_i = (s * n + i) as f64;
-                        let cfo_phase = -TAU * cfo_frac / n as f64 * global_i;
-                        let (sin, cos) = cfo_phase.sin_cos();
-                        let cfo_rot = Complex::new(cos as f32, sin as f32);
-                        let corrected = samples[sym_start + i * os_factor as usize] * cfo_rot;
-                        sto_buf[i] = corrected * downchirp[i];
-                    }
-                    // Zero-pad.
-                    for b in &mut sto_buf[n..] { *b = Complex::new(0.0, 0.0); }
-
-                    fft_2n.process(&mut sto_buf);
-                    for (a, b) in sto_acc.iter_mut().zip(sto_buf.iter()) {
-                        *a += b.norm_sqr() as f64;
-                    }
-                    // Reset buf for next iteration.
-                    for b in &mut sto_buf { *b = Complex::new(0.0, 0.0); }
-                }
-
-                let k0 = sto_acc.iter().enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(i, _)| i).unwrap_or(0);
-
-                let y_m1 = sto_acc[(k0 + fft_len - 1) % fft_len];
-                let y_0  = sto_acc[k0];
-                let y_p1 = sto_acc[(k0 + 1) % fft_len];
-
-                let ka = rctsl_frac(y_m1, y_0, y_p1, n);
-                let k_residual = ((k0 as f64 + ka) / 2.0).rem_euclid(1.0);
-                let sto = if k_residual > 0.5 { k_residual - 1.0 } else { k_residual };
-
-                eprintln!("[sync] STO estimate: {sto:.4} (fractional sample offset)");
-                sto
-            } else {
-                0.0
-            };
-
-            // ── Phase 5: Compute alignment and sync word position ────────
-            // For strong signals, use circular mean of per-window bins.
-            // For weak signals, use the accumulation bin directly.
-            let mean_bin = if strong {
-                let mut sin_sum = 0.0_f64;
-                let mut cos_sum = 0.0_f64;
-                for wi in best_run_start..best_run_start + best_run_len {
-                    let widx = wi * sps;
-                    let bin = symbol_bin(&mut buf, &samples[widx..widx + sps],
-                        os_factor as usize, &downchirp, fft_n.as_ref());
-                    let angle = TAU * bin as f64 / n as f64;
-                    sin_sum += angle.sin();
-                    cos_sum += angle.cos();
-                }
-                let mean_angle = sin_sum.atan2(cos_sum);
-                ((mean_angle / TAU * n as f64).round() as isize).rem_euclid(n as isize) as usize
-            } else {
-                preamble_bin
-            };
-
-            let d = ((n - mean_bin) % n) * os_factor as usize;
-            let sync_start    = if 2 * d < sps { end_w + d } else { end_w + d - sps };
-            let payload_start = sync_start + 4 * sps + sps / 4;
-
-            // ── Phase 6: Sync word validation / threshold gating ────────
-            // Gate weak signals before expensive CFO/SFO extraction.
-            if sync_start + 2 * sps <= samples.len() {
-                let exp_sw0 = ((sync_word as usize & 0xF0) >> 4) << 3;
-                let exp_sw1 =  (sync_word as usize & 0x0F)       << 3;
-                let det_sw0 = symbol_bin(&mut buf,
-                    &samples[sync_start..sync_start + sps],
-                    os_factor as usize, &downchirp, fft_n.as_ref());
-                let det_sw1 = symbol_bin(&mut buf,
-                    &samples[sync_start + sps..sync_start + 2 * sps],
-                    os_factor as usize, &downchirp, fft_n.as_ref());
-
-                let sw_ok = bins_close_tol(det_sw0, exp_sw0, n, sw_tol)
-                         && bins_close_tol(det_sw1, exp_sw1, n, sw_tol);
-
-                if strong {
-                    eprintln!("[sync] preamble: bin={preamble_bin} run={best_run_len} \
-                               peak/mean={ratio:.1}, sw: [{det_sw0},{det_sw1}] exp=[{exp_sw0},{exp_sw1}]");
-                    if !sw_ok {
-                        eprintln!("[sync] sync word REJECTED (tol=±{sw_tol})");
-                        let skip_to = w_start + pre_len + 1;
-                        if skip_to >= n_windows { break; }
-                        while w_start < skip_to {
-                            let new_w = w_start + pre_len;
-                            if new_w >= n_windows { return not_found(w_start * sps); }
-                            let old = &ring[ring_idx];
-                            for (a, o) in acc.iter_mut().zip(old.iter()) { *a -= o; }
-                            let s = new_w * sps;
-                            symbol_spectrum(&mut buf, &samples[s..s + sps],
-                                os_factor as usize, &downchirp, fft_n.as_ref());
-                            let mag2: Vec<f64> = buf.iter().map(|c| c.norm_sqr() as f64).collect();
-                            for (a, m) in acc.iter_mut().zip(mag2.iter()) { *a += m; }
-                            ring[ring_idx] = mag2;
-                            ring_idx = (ring_idx + 1) % pre_len;
-                            w_start += 1;
-                        }
-                        continue;
-                    }
-                } else if ratio > weak_decode_threshold {
-                    eprintln!("[sync] weak preamble: bin={preamble_bin} run={best_run_len} peak/mean={ratio:.1}");
-                } else {
-                    eprintln!("[sync] marginal: bin={preamble_bin} run={best_run_len} peak/mean={ratio:.1} — skip");
-                    let skip_to = w_start + pre_len + 1;
-                    if skip_to >= n_windows { break; }
-                    while w_start < skip_to {
-                        let new_w = w_start + pre_len;
-                        if new_w >= n_windows { return not_found(w_start * sps); }
-                        let old = &ring[ring_idx];
-                        for (a, o) in acc.iter_mut().zip(old.iter()) { *a -= o; }
-                        let s = new_w * sps;
-                        symbol_spectrum(&mut buf, &samples[s..s + sps],
-                            os_factor as usize, &downchirp, fft_n.as_ref());
-                        let mag2: Vec<f64> = buf.iter().map(|c| c.norm_sqr() as f64).collect();
-                        for (a, m) in acc.iter_mut().zip(mag2.iter()) { *a += m; }
-                        ring[ring_idx] = mag2;
-                        ring_idx = (ring_idx + 1) % pre_len;
-                        w_start += 1;
-                    }
+            // ── NET_ID1: skip additional upchirps (bins near 0) ──────
+            let net_id1;
+            loop {
+                let b = match demod_sym(
+                    &mut buf, samples, pos, sps, os_factor as usize,
+                    &cfo_corr, &downchirp, fft_n.as_ref(),
+                ) {
+                    Some(b) => b,
+                    None    => return not_found(w_start * sps),
+                };
+                if b <= 1 || b >= n - 1 {
+                    pos += sps;
                     continue;
                 }
+                net_id1 = b;
+                break;
             }
+            pos += sps;
 
-            // ── Phase 6b: Integer CFO from downchirp symbols ─────────────
-            // Only computed after passing sync word / threshold gate above.
-            // The two downchirps sit at sync_start + 2*sps .. +4*sps.
-            // Dechirping a downchirp with the upchirp reference yields
-            // down_val ≈ 2 × cfo_int  (Tapparel et al.).
-            let dc_start = sync_start + 2 * sps;
-            let cfo_int = if dc_start + sps <= samples.len() {
-                let down_val = symbol_bin(
-                    &mut buf,
-                    &samples[dc_start..dc_start + sps],
-                    os_factor as usize,
-                    &upchirp,
-                    fft_n.as_ref(),
-                );
-                if (down_val) < n / 2 {
-                    (down_val as f64 / 2.0).floor()
-                } else {
-                    ((down_val as f64 - n as f64) / 2.0).floor()
-                }
-            } else {
-                0.0
+            // ── NET_ID2 ──────────────────────────────────────────────
+            let net_id2 = match demod_sym(
+                &mut buf, samples, pos, sps, os_factor as usize,
+                &cfo_corr, &downchirp, fft_n.as_ref(),
+            ) {
+                Some(b) => b,
+                None    => return not_found(w_start * sps),
             };
+            pos += sps;
 
+            // ── DOWNCHIRP1 — consume ─────────────────────────────────
+            if pos + sps > samples.len() { return not_found(w_start * sps); }
+            pos += sps;
+
+            // ── DOWNCHIRP2 — extract down_val ────────────────────────
+            let down_val = match demod_sym(
+                &mut buf, samples, pos, sps, os_factor as usize,
+                &cfo_corr, &upchirp, fft_n.as_ref(),
+            ) {
+                Some(b) => b,
+                None    => return not_found(w_start * sps),
+            };
+            pos += sps;
+
+            // Integer CFO from downchirp.
+            let cfo_int = if down_val < n / 2 {
+                (down_val as f64 / 2.0).floor()
+            } else {
+                ((down_val as f64 - n as f64) / 2.0).floor()
+            };
             let total_cfo = cfo_int + cfo_frac;
 
-            // ── Phase 6c: SFO estimate from total CFO ────────────────────
-            // SFO = (total_cfo × bw) / center_freq  (clock offset relationship).
+            // SFO estimate.
             let sfo_hat = if center_freq_hz > 0.0 {
                 total_cfo * bw_hz / center_freq_hz
             } else {
                 0.0
             };
 
-            eprintln!("[sync] → decoding: run={best_run_len} cfo_int={cfo_int:.0} cfo_frac={cfo_frac:.4} \
-                       total={total_cfo:.4} sfo={sfo_hat:.6}");
+            // Final alignment: quarter downchirp + cfo_int correction.
+            let cfo_int_samples = (os_factor as isize) * (cfo_int as isize);
+            let payload_start = (pos as isize + sps as isize / 4 + cfo_int_samples)
+                .max(0) as usize;
 
-            // ── Phase 7: Extract payload with CFO + SFO + STO correction ─
-            if payload_start + sps <= samples.len() {
-                let n_payload_samps = samples.len() - payload_start;
-                let n_payload_syms  = n_payload_samps / sps;
-                let len = n_payload_syms * sps;
+            // ── Sync word validation ─────────────────────────────────
+            let exp_sw0 = ((sync_word as usize & 0xF0) >> 4) << 3;
+            let exp_sw1 =  (sync_word as usize & 0x0F)       << 3;
+            let sw_ok = bins_close(net_id1, exp_sw0, n, 4)
+                     && bins_close(net_id2, exp_sw1, n, 4);
 
-                // Evolve STO from preamble start to payload start:
-                //   preamble_len upchirps + 2 sync word + 2.25 downchirps
-                let sto_evolved = sto_frac + sfo_hat * (pre_len as f64 + 4.25);
-                let sto_offset  = (sto_evolved * os_factor as f64).round() as isize;
+            eprintln!("[sync] ratio={ratio:.1} k_hat={k_hat} cfo_int={cfo_int:.0} \
+                       cfo_frac={cfo_frac:.4} total={total_cfo:.4} sfo={sfo_hat:.6} \
+                       sw=[{net_id1},{net_id2}] exp=[{exp_sw0},{exp_sw1}] ok={sw_ok}");
 
-                let mut corrected = Vec::with_capacity(len);
-                let mut sfo_cum: f64 = 0.0;
-                let mut sample_adjust: isize = 0;
-                let os = os_factor as f64;
-
-                for sym in 0..n_payload_syms {
-                    for i in 0..sps {
-                        let global_i = sym * sps + i;
-                        // Source index: payload base + position + STO + cumulative SFO drift.
-                        let src_idx = payload_start as isize
-                            + global_i as isize
-                            + sto_offset
-                            + sample_adjust;
-                        let src_idx = src_idx.clamp(0, samples.len() as isize - 1) as usize;
-
-                        // Phase rotation by total CFO (integer + fractional).
-                        let phase = -TAU * total_cfo / n as f64 * global_i as f64;
-                        let (sin, cos) = phase.sin_cos();
-                        let rot = Complex::new(cos as f32, sin as f32);
-                        corrected.push(samples[src_idx] * rot);
-                    }
-
-                    // SFO tracking: accumulate drift per symbol, adjust when
-                    // it exceeds half an oversampled sample period.
-                    sfo_cum += sfo_hat;
-                    if sfo_cum.abs() > 0.5 / os {
-                        let adj = if sfo_cum > 0.0 { 1_isize } else { -1 };
-                        sample_adjust += adj;
-                        sfo_cum -= adj as f64 / os;
-                    }
+            if !sw_ok {
+                // Skip past this detection and retry.
+                let skip_to = w_start + pre_len + 1;
+                if skip_to >= n_windows { break; }
+                while w_start < skip_to {
+                    let new_w = w_start + pre_len;
+                    if new_w >= n_windows { return not_found(w_start * sps); }
+                    let old = &ring[ring_idx];
+                    for (a, o) in acc.iter_mut().zip(old.iter()) { *a -= o; }
+                    let s = new_w * sps;
+                    symbol_spectrum(&mut buf, &samples[s..s + sps],
+                        os_factor as usize, &downchirp, fft_n.as_ref());
+                    let mag2: Vec<f64> = buf.iter().map(|c| c.norm_sqr() as f64).collect();
+                    for (a, m) in acc.iter_mut().zip(mag2.iter()) { *a += m; }
+                    ring[ring_idx] = mag2;
+                    ring_idx = (ring_idx + 1) % pre_len;
+                    w_start += 1;
                 }
-
-                let consumed = if strong {
-                    payload_start + len
-                } else {
-                    (end_w + 5 * sps).min(payload_start + len)
-                };
-
-                return FrameSyncResult {
-                    found: true,
-                    symbols: corrected,
-                    consumed,
-                    freq_offset_bins: total_cfo,
-                };
+                continue;
             }
 
-            // Preamble found but not enough payload yet.
+            // ════════════════════════════════════════════════════════════
+            // Payload extraction with CFO + STO + SFO correction.
+            // ════════════════════════════════════════════════════════════
+            if payload_start + sps > samples.len() {
+                eprintln!("[sync] not enough payload: pos={payload_start} len={}",
+                    samples.len());
+                return not_found(w_start * sps);
+            }
+
+            let n_payload_samps = samples.len() - payload_start;
+            let n_payload_syms  = n_payload_samps / sps;
+            let len = n_payload_syms * sps;
+            eprintln!("[sync] payload: {n_payload_syms} symbols from pos {payload_start}");
+
+            let sto_evolved = sto_frac + sfo_hat * (pre_len as f64 + 4.25);
+            let sto_offset  = (sto_evolved * os_factor as f64).round() as isize;
+
+            let mut corrected = Vec::with_capacity(len);
+            let mut sfo_cum: f64 = 0.0;
+            let mut sample_adjust: isize = 0;
+            let os = os_factor as f64;
+
+            for sym in 0..n_payload_syms {
+                for i in 0..sps {
+                    let global_i = sym * sps + i;
+                    let src_idx = payload_start as isize
+                        + global_i as isize + sto_offset + sample_adjust;
+                    let src_idx = src_idx.clamp(0, samples.len() as isize - 1) as usize;
+                    let phase = -TAU * total_cfo / n as f64 * global_i as f64;
+                    let (sin, cos) = phase.sin_cos();
+                    let rot = Complex::new(cos as f32, sin as f32);
+                    corrected.push(samples[src_idx] * rot);
+                }
+                sfo_cum += sfo_hat;
+                if sfo_cum.abs() > 0.5 / os {
+                    let adj = if sfo_cum > 0.0 { 1_isize } else { -1 };
+                    sample_adjust += adj;
+                    sfo_cum -= adj as f64 / os;
+                }
+            }
+
             return FrameSyncResult {
-                found: false, symbols: vec![],
-                consumed: if strong { best_run_start * sps } else { w_start * sps },
+                found: true,
+                symbols: corrected,
+                consumed: payload_start + len,
                 freq_offset_bins: total_cfo,
             };
         }
 
-        // ── Slide window ─────────────────────────────────────────────────
+        // ── Slide window by 1 ────────────────────────────────────────────
         let new_w = w_start + pre_len;
         if new_w >= n_windows { break; }
 
