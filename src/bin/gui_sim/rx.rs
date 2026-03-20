@@ -72,7 +72,7 @@ pub(crate) async fn rx_worker(mut jobs: tokio::sync::mpsc::UnboundedReceiver<RxJ
 
             let payload_start = sync.consumed - sync.symbols.len();
 
-            match rx.decode_payload(&sync.symbols) {
+            match rx.decode_payload_with_cfo(&sync.symbols, sync.cfo_int, sync.cfo_frac, sync.sfo_hat) {
                 DecodeResult::Ok { payload, samples_used } if payload.len() >= 2 => {
                     let seq  = u16::from_le_bytes([payload[0], payload[1]]);
                     let text = String::from_utf8_lossy(&payload[2..]).to_string();

@@ -52,7 +52,11 @@ pub fn modulate(
     append_upchirp(&mut out, sw1, sf, os_factor);
     append_downchirp(&mut out, sf, os_factor, 2 * sps + sps / 4);
     for &sym in symbols {
-        append_upchirp(&mut out, sym, sf, os_factor);
+        // Standard LoRa symbol convention: add 1 mod N before modulation.
+        // Real LoRa chips (SX1276/SX1262) use this offset; the RX compensates
+        // with -1 in fft_demod.  This ensures interop with external nodes.
+        let id = (sym + 1) % (1u32 << sf);
+        append_upchirp(&mut out, id, sf, os_factor);
     }
     out
 }

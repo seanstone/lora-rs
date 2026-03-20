@@ -8,6 +8,12 @@ pub struct FrameSyncResult {
     pub consumed: usize,
     /// Estimated total frequency offset in bins (integer + fractional).
     pub freq_offset_bins: f64,
+    /// Integer CFO in bins (from downchirp demod).
+    pub cfo_int:  f64,
+    /// Fractional CFO in bins (from Bernier estimator).
+    pub cfo_frac: f64,
+    /// Estimated sampling frequency offset (from CFO + BW/center_freq).
+    pub sfo_hat:  f64,
 }
 
 // ── Reference chirps ─────────────────────────────────────────────────────────
@@ -203,10 +209,11 @@ pub fn frame_sync(
     let fft_n  = planner.plan_fft_forward(n);
     let mut buf = vec![Complex::new(0.0_f32, 0.0); n];
 
-    let detect_threshold: f64 = 6.0;
+    let detect_threshold: f64 = 4.0;
 
     let not_found = |consumed: usize| FrameSyncResult {
         found: false, symbols: vec![], consumed, freq_offset_bins: 0.0,
+        cfo_int: 0.0, cfo_frac: 0.0, sfo_hat: 0.0,
     };
 
     let n_windows = samples.len().saturating_sub(sps - 1) / sps;
@@ -241,11 +248,10 @@ pub fn frame_sync(
             // ════════════════════════════════════════════════════════════
             // Phase 2: gr-lora_sdr-style SYNC walk.
             //
-            // The accumulation window [w_start, w_start+pre_len) detected
-            // a preamble.  k_hat = peak_idx = (τ + ε) mod N.
-            //
-            // Walk forward from end_w through the remaining frame:
-            //   additional upchirps → sync words → downchirps → payload
+            // k_hat = peak_idx = (τ + ε) mod N.
+            // If sync word check fails (bad alignment), advance by 1
+            // window and retry — alignment improves as the accumulation
+            // slides into better overlap with the preamble.
             // ════════════════════════════════════════════════════════════
             let k_hat = peak_idx;
             let end_w_samples = (w_start + pre_len) * sps;
@@ -333,45 +339,52 @@ pub fn frame_sync(
                 0.0
             };
 
-            // Final alignment: quarter downchirp + cfo_int correction.
-            let cfo_int_samples = (os_factor as isize) * (cfo_int as isize);
-            let payload_start = (pos as isize + sps as isize / 4 + cfo_int_samples)
-                .max(0) as usize;
-
             // ── Sync word validation ─────────────────────────────────
             let exp_sw0 = ((sync_word as usize & 0xF0) >> 4) << 3;
             let exp_sw1 =  (sync_word as usize & 0x0F)       << 3;
             let sw_ok = bins_close(net_id1, exp_sw0, n, 4)
                      && bins_close(net_id2, exp_sw1, n, 4);
 
+            // net_id_off: residual alignment error from sync word detection
+            // (matches gr-lora_sdr frame_sync_impl.cc:771,788)
+            let net_id_off = if sw_ok {
+                let diff = net_id1 as isize - exp_sw0 as isize;
+                // wrap into [-N/2, N/2)
+                if diff > n as isize / 2 { diff - n as isize }
+                else if diff < -(n as isize / 2) { diff + n as isize }
+                else { diff }
+            } else {
+                0
+            };
+
             eprintln!("[sync] ratio={ratio:.1} k_hat={k_hat} cfo_int={cfo_int:.0} \
                        cfo_frac={cfo_frac:.4} total={total_cfo:.4} sfo={sfo_hat:.6} \
-                       sw=[{net_id1},{net_id2}] exp=[{exp_sw0},{exp_sw1}] ok={sw_ok}");
+                       sw=[{net_id1},{net_id2}] exp=[{exp_sw0},{exp_sw1}] ok={sw_ok} \
+                       net_id_off={net_id_off}");
 
             if !sw_ok {
-                // Skip past this detection and retry.
-                let skip_to = w_start + pre_len + 1;
-                if skip_to >= n_windows { break; }
-                while w_start < skip_to {
-                    let new_w = w_start + pre_len;
-                    if new_w >= n_windows { return not_found(w_start * sps); }
-                    let old = &ring[ring_idx];
-                    for (a, o) in acc.iter_mut().zip(old.iter()) { *a -= o; }
-                    let s = new_w * sps;
-                    symbol_spectrum(&mut buf, &samples[s..s + sps],
-                        os_factor as usize, &downchirp, fft_n.as_ref());
-                    let mag2: Vec<f64> = buf.iter().map(|c| c.norm_sqr() as f64).collect();
-                    for (a, m) in acc.iter_mut().zip(mag2.iter()) { *a += m; }
-                    ring[ring_idx] = mag2;
-                    ring_idx = (ring_idx + 1) % pre_len;
-                    w_start += 1;
-                }
-                continue;
-            }
+                // Sync word mismatch — advance by 1 window and retry.
+                // As the accumulation window slides into better overlap
+                // with the preamble, alignment improves.
+                // Fall through to the slide-window code below.
+            } else {
 
             // ════════════════════════════════════════════════════════════
             // Payload extraction with CFO + STO + SFO correction.
             // ════════════════════════════════════════════════════════════
+
+            // Update STO estimate to track drift through preamble + sync region
+            // (matches gr-lora_sdr frame_sync_impl.cc:686,798)
+            let sto_at_payload = sto_frac + sfo_hat * (pre_len as f64 + 4.25);
+
+            // Payload start: quarter downchirp + cfo_int correction + net_id_off
+            // (matches gr-lora_sdr frame_sync_impl.cc:810)
+            let cfo_int_samples = (os_factor as isize) * (cfo_int as isize);
+            let net_id_off_samples = -(os_factor as isize) * net_id_off;
+            let payload_start = (pos as isize + sps as isize / 4
+                + cfo_int_samples + net_id_off_samples)
+                .max(0) as usize;
+
             if payload_start + sps > samples.len() {
                 eprintln!("[sync] not enough payload: pos={payload_start} len={}",
                     samples.len());
@@ -383,31 +396,14 @@ pub fn frame_sync(
             let len = n_payload_syms * sps;
             eprintln!("[sync] payload: {n_payload_syms} symbols from pos {payload_start}");
 
-            let sto_evolved = sto_frac + sfo_hat * (pre_len as f64 + 4.25);
-            let sto_offset  = (sto_evolved * os_factor as f64).round() as isize;
+            // Apply STO fine correction to payload samples
+            let sto_offset = (sto_at_payload * os_factor as f64).round() as isize;
 
             let mut corrected = Vec::with_capacity(len);
-            let mut sfo_cum: f64 = 0.0;
-            let mut sample_adjust: isize = 0;
-            let os = os_factor as f64;
-
-            for sym in 0..n_payload_syms {
-                for i in 0..sps {
-                    let global_i = sym * sps + i;
-                    let src_idx = payload_start as isize
-                        + global_i as isize + sto_offset + sample_adjust;
-                    let src_idx = src_idx.clamp(0, samples.len() as isize - 1) as usize;
-                    let phase = -TAU * total_cfo / n as f64 * global_i as f64;
-                    let (sin, cos) = phase.sin_cos();
-                    let rot = Complex::new(cos as f32, sin as f32);
-                    corrected.push(samples[src_idx] * rot);
-                }
-                sfo_cum += sfo_hat;
-                if sfo_cum.abs() > 0.5 / os {
-                    let adj = if sfo_cum > 0.0 { 1_isize } else { -1 };
-                    sample_adjust += adj;
-                    sfo_cum -= adj as f64 / os;
-                }
+            for i in 0..len {
+                let src_idx = (payload_start as isize + i as isize + sto_offset)
+                    .clamp(0, samples.len() as isize - 1) as usize;
+                corrected.push(samples[src_idx]);
             }
 
             return FrameSyncResult {
@@ -415,7 +411,11 @@ pub fn frame_sync(
                 symbols: corrected,
                 consumed: payload_start + len,
                 freq_offset_bins: total_cfo,
+                cfo_int,
+                cfo_frac,
+                sfo_hat,
             };
+            } // end sw_ok else block
         }
 
         // ── Slide window by 1 ────────────────────────────────────────────

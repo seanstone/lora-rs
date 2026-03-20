@@ -118,7 +118,7 @@ impl Rx {
             self.center_freq_hz, self.bw_hz,
         );
         if !sync.found { return None; }
-        match self.decode_payload(&sync.symbols) {
+        match self.decode_payload_with_cfo(&sync.symbols, sync.cfo_int, sync.cfo_frac, sync.sfo_hat) {
             DecodeResult::Ok { payload, .. } => Some(payload),
             _ => None,
         }
@@ -140,7 +140,7 @@ impl Rx {
         );
         if !sync.found { return StreamDecodeResult::None; }
         let fob = sync.freq_offset_bins;
-        match self.decode_payload(&sync.symbols) {
+        match self.decode_payload_with_cfo(&sync.symbols, sync.cfo_int, sync.cfo_frac, sync.sfo_hat) {
             DecodeResult::Ok { payload, samples_used: _ } => {
                 StreamDecodeResult::Ok { payload, consumed: sync.consumed, freq_offset_bins: fob }
             }
@@ -154,12 +154,22 @@ impl Rx {
 
     /// Decode from already-extracted payload symbols (post frame-sync).
     ///
+    /// Backward-compatible entry point (assumes zero CFO/SFO — simulation only).
+    pub fn decode_payload(&self, symbols: &[Complex<f32>]) -> DecodeResult {
+        self.decode_payload_with_cfo(symbols, 0.0, 0.0, 0.0)
+    }
+
+    /// Decode from already-extracted payload symbols with CFO/SFO correction.
+    ///
     /// Returns `Incomplete` when the header parses but there are not yet
     /// enough nibbles for the full payload + CRC.  On success `samples_used`
     /// is the exact number of payload IQ samples consumed — the caller should
     /// drain `payload_start + samples_used` from the streaming buffer.
-    pub fn decode_payload(&self, symbols: &[Complex<f32>]) -> DecodeResult {
-        let chirps    = fft_demod(symbols, self.sf, self.os_factor);
+    pub fn decode_payload_with_cfo(
+        &self, symbols: &[Complex<f32>],
+        cfo_int: f64, cfo_frac: f64, sfo_hat: f64,
+    ) -> DecodeResult {
+        let chirps    = fft_demod(symbols, self.sf, self.os_factor, cfo_int, cfo_frac, sfo_hat);
         let mapped    = gray_map(&chirps, self.sf);
         let codewords = deinterleave(&mapped, self.cr, self.sf, false);
         let nibbles   = hamming_dec(&codewords, self.cr, self.sf);
