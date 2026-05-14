@@ -357,6 +357,7 @@ pub fn frame_sync(
                 0
             };
 
+            #[cfg(debug_assertions)]
             eprintln!("[sync] ratio={ratio:.1} k_hat={k_hat} cfo_int={cfo_int:.0} \
                        cfo_frac={cfo_frac:.4} total={total_cfo:.4} sfo={sfo_hat:.6} \
                        sw=[{net_id1},{net_id2}] exp=[{exp_sw0},{exp_sw1}] ok={sw_ok} \
@@ -386,6 +387,7 @@ pub fn frame_sync(
                 .max(0) as usize;
 
             if payload_start + sps > samples.len() {
+                #[cfg(debug_assertions)]
                 eprintln!("[sync] not enough payload: pos={payload_start} len={}",
                     samples.len());
                 return not_found(w_start * sps);
@@ -394,6 +396,7 @@ pub fn frame_sync(
             let n_payload_samps = samples.len() - payload_start;
             let n_payload_syms  = n_payload_samps / sps;
             let len = n_payload_syms * sps;
+            #[cfg(debug_assertions)]
             eprintln!("[sync] payload: {n_payload_syms} symbols from pos {payload_start}");
 
             // Apply STO fine correction to payload samples
